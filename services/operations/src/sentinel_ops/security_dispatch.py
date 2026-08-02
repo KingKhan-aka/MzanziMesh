@@ -47,6 +47,11 @@ WHATSAPP_TEMPLATE_NAME = os.getenv("WHATSAPP_CLOUD_TEMPLATE_NAME", "mzansimesh_s
 WHATSAPP_TEMPLATE_LANGUAGE = os.getenv("WHATSAPP_CLOUD_TEMPLATE_LANGUAGE", "en_US").strip()
 WHATSAPP_GRAPH_VERSION = os.getenv("WHATSAPP_GRAPH_VERSION", "v23.0").strip()
 WHATSAPP_MESSAGE_TEXT = os.getenv("WHATSAPP_CLOUD_MESSAGE_TEXT", "").strip()
+WHATSAPP_AUTO_SEND_FREE_ONLY = os.getenv("WHATSAPP_AUTO_SEND_FREE_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+try:
+    WHATSAPP_AUTO_SEND_DAILY_LIMIT = max(1, int(os.getenv("WHATSAPP_AUTO_SEND_DAILY_LIMIT", "10")))
+except ValueError:
+    WHATSAPP_AUTO_SEND_DAILY_LIMIT = 10
 
 # The street names are real Benoni/Lakefield roads, while the points and movement are
 # deliberately approximate for the demo.  Production routing would use a road graph
@@ -171,6 +176,9 @@ def _whatsapp_configuration() -> dict[str, Any]:
         "template": WHATSAPP_TEMPLATE_NAME or None,
         "message_text": WHATSAPP_MESSAGE_TEXT or None,
         "message_type": "text" if WHATSAPP_MESSAGE_TEXT else "template",
+        "auto_send_free_only": WHATSAPP_AUTO_SEND_FREE_ONLY,
+        "auto_send_daily_limit": WHATSAPP_AUTO_SEND_DAILY_LIMIT,
+        "billing_guard": "SERVICE_TEXT_ONLY" if WHATSAPP_AUTO_SEND_FREE_ONLY else "MANUAL",
         "language": WHATSAPP_TEMPLATE_LANGUAGE,
         "graph_version": WHATSAPP_GRAPH_VERSION,
         "missing": missing,
@@ -244,6 +252,129 @@ def _send_whatsapp_template(notification: dict[str, Any], dispatch: dict[str, An
         "message_type": payload["type"],
         "accepted": bool(message_id),
         "raw": result,
+    }
+
+
+def _persist_whatsapp_delivery(
+    db,
+    notification: dict[str, Any],
+    provider_result: dict[str, Any],
+    *,
+    actor: str,
+    automatic: bool,
+) -> dict[str, Any]:
+    stored_result = dict(provider_result) | {"automatic": automatic}
+    stored_payload = _json(notification.get("provider_payload_json"), {}) or {}
+    stored_payload["real_delivery"] = stored_result
+    db.execute(
+        """
+        UPDATE security_notifications
+        SET status='SENT_TO_PROVIDER', provider_payload_json=?
+        WHERE notification_id=?
+        """,
+        (_safe_json(stored_payload), notification["notification_id"]),
+    )
+    _activity(
+        db,
+        "WHATSAPP_AUTO_SENT" if automatic else "WHATSAPP_SENT_TO_PROVIDER",
+        "Free service WhatsApp accepted" if automatic else "Real WhatsApp message accepted",
+        f"{notification['notification_id']} was accepted by Meta for {stored_result['recipient']}.",
+        actor=actor,
+        payload={
+            "notification_id": notification["notification_id"],
+            "message_id": stored_result.get("message_id"),
+            "recipient": stored_result["recipient"],
+            "automatic": automatic,
+            "billing_guard": "SERVICE_TEXT_ONLY" if automatic else "MANUAL",
+        },
+    )
+    _queue_entity(
+        db,
+        "security_notifications",
+        notification["notification_id"],
+        "UPDATE",
+        {
+            "status": "SENT_TO_PROVIDER",
+            "provider_message_id": stored_result.get("message_id"),
+            "automatic": automatic,
+        },
+        actor,
+    )
+    item = dict(db.execute(
+        "SELECT * FROM security_notifications WHERE notification_id=?",
+        (notification["notification_id"],),
+    ).fetchone())
+    return item | {"provider": stored_result, "provider_payload": stored_payload}
+
+
+def _auto_send_free_whatsapp(db, dispatch: dict[str, Any]) -> dict[str, Any]:
+    """Auto-send one primary response message without allowing billable templates."""
+    if not WHATSAPP_AUTO_SEND_FREE_ONLY:
+        return {"status": "DISABLED", "billing_guard": "SERVICE_TEXT_ONLY"}
+    config = _whatsapp_configuration()
+    if not config["configured"]:
+        return {"status": "NOT_CONFIGURED", "missing": config["missing"], "billing_guard": "SERVICE_TEXT_ONLY"}
+    if config["message_type"] != "text" or not WHATSAPP_MESSAGE_TEXT:
+        return {
+            "status": "BLOCKED_BY_FREE_ONLY_GUARD",
+            "reason": "Automatic template delivery is disabled to prevent billable messages.",
+            "billing_guard": "SERVICE_TEXT_ONLY",
+        }
+    today = _now()[:10]
+    sent_today = int(db.execute(
+        "SELECT COUNT(*) FROM security_activity WHERE event_type='WHATSAPP_AUTO_SENT' AND substr(created_at,1,10)=?",
+        (today,),
+    ).fetchone()[0])
+    if sent_today >= WHATSAPP_AUTO_SEND_DAILY_LIMIT:
+        return {
+            "status": "DAILY_LIMIT_REACHED",
+            "limit": WHATSAPP_AUTO_SEND_DAILY_LIMIT,
+            "billing_guard": "SERVICE_TEXT_ONLY",
+        }
+    row = db.execute(
+        """
+        SELECT * FROM security_notifications
+        WHERE dispatch_id=? AND unit_id=?
+        ORDER BY created_at LIMIT 1
+        """,
+        (dispatch["dispatch_id"], dispatch.get("selected_unit_id")),
+    ).fetchone()
+    if not row:
+        return {"status": "NO_PRIMARY_NOTIFICATION", "billing_guard": "SERVICE_TEXT_ONLY"}
+    notification = dict(row)
+    if notification["status"] == "SENT_TO_PROVIDER":
+        return {
+            "status": "ALREADY_SENT",
+            "notification_id": notification["notification_id"],
+            "billing_guard": "SERVICE_TEXT_ONLY",
+        }
+    try:
+        provider_result = _send_whatsapp_template(notification, dispatch)
+    except HTTPException as exc:
+        detail = exc.detail.get("message") if isinstance(exc.detail, dict) else str(exc.detail)
+        _activity(
+            db,
+            "WHATSAPP_AUTO_FAILED",
+            "Automatic WhatsApp not delivered",
+            detail or "Meta did not accept the free service message.",
+            actor="MzansiMesh automatic dispatch",
+            payload={"dispatch_id": dispatch["dispatch_id"], "notification_id": notification["notification_id"]},
+        )
+        return {"status": "PROVIDER_REJECTED", "detail": detail, "billing_guard": "SERVICE_TEXT_ONLY"}
+    _persist_whatsapp_delivery(
+        db,
+        notification,
+        provider_result,
+        actor="MzansiMesh automatic dispatch",
+        automatic=True,
+    )
+    return {
+        "status": "SENT_TO_PROVIDER",
+        "notification_id": notification["notification_id"],
+        "accepted": bool(provider_result.get("accepted")),
+        "message_id_present": bool(provider_result.get("message_id")),
+        "billing_guard": "SERVICE_TEXT_ONLY",
+        "daily_limit": WHATSAPP_AUTO_SEND_DAILY_LIMIT,
     }
 
 
@@ -1026,7 +1157,7 @@ def create_dispatch_for_member_incident(db, incident_id: str, *, actor: str = "S
     _queue_entity(db, "security_dispatches", dispatch_id, "INSERT", dispatch, actor)
     payload = _dispatch_payload(db, dispatch_id)
     assert payload is not None
-    return payload
+    return payload | {"auto_whatsapp": _auto_send_free_whatsapp(db, payload)}
 
 
 def queue_repeat_intruder_notifications(
@@ -1564,42 +1695,13 @@ def send_notification_whatsapp(notification_id: str):
         if not dispatch:
             raise HTTPException(status_code=404, detail="dispatch not found")
         provider_result = _send_whatsapp_template(notification, dispatch)
-        now = _now()
-        stored_payload = _json(notification.get("provider_payload_json"), {}) or {}
-        stored_payload["real_delivery"] = provider_result
-        db.execute(
-            """
-            UPDATE security_notifications
-            SET status='SENT_TO_PROVIDER', provider_payload_json=?
-            WHERE notification_id=?
-            """,
-            (_safe_json(stored_payload), notification_id),
-        )
-        _activity(
+        return _persist_whatsapp_delivery(
             db,
-            "WHATSAPP_SENT_TO_PROVIDER",
-            "Real WhatsApp message accepted",
-            f"{notification_id} was accepted by Meta for {provider_result['recipient']}.",
+            notification,
+            provider_result,
             actor="MzansiMesh Security",
-            payload={
-                "notification_id": notification_id,
-                "message_id": provider_result.get("message_id"),
-                "recipient": provider_result["recipient"],
-            },
+            automatic=False,
         )
-        _queue_entity(
-            db,
-            "security_notifications",
-            notification_id,
-            "UPDATE",
-            {"status": "SENT_TO_PROVIDER", "provider_message_id": provider_result.get("message_id")},
-            "MzansiMesh Security",
-        )
-        item = dict(db.execute(
-            "SELECT * FROM security_notifications WHERE notification_id=?",
-            (notification_id,),
-        ).fetchone())
-    return item | {"provider": provider_result, "provider_payload": _json(item.get("provider_payload_json"), {})}
 
 
 @router.post("/api/security/notifications/{notification_id}/simulate-send")

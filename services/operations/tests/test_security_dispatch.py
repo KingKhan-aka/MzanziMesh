@@ -2,6 +2,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import sentinel_ops.security_dispatch as security_dispatch_module
 from sentinel_ops.main import app
 from sentinel_ops.member_mesh import initialise_member_store
 from sentinel_ops.security_dispatch import initialise_security_store
@@ -130,3 +131,49 @@ def test_control_room_test_alert_creates_member_incident_and_dispatch(tmp_path: 
 
     mesh = client.get("/api/member/mesh-state").json()
     assert mesh["active_incidents"][0]["origin_household"] == "10 Killarney Avenue"
+
+
+def test_test_alert_auto_sends_one_free_service_message(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SENTINEL_DATABASE_PATH", str(tmp_path / "auto-whatsapp.db"))
+    monkeypatch.setattr(security_dispatch_module, "WHATSAPP_AUTO_SEND_FREE_ONLY", True)
+    monkeypatch.setattr(security_dispatch_module, "WHATSAPP_AUTO_SEND_DAILY_LIMIT", 10)
+    monkeypatch.setattr(security_dispatch_module, "WHATSAPP_MESSAGE_TEXT", "RESPONSE IS ON THE WAY")
+    monkeypatch.setattr(security_dispatch_module, "WHATSAPP_PHONE_NUMBER_ID", "test-phone-id")
+    monkeypatch.setattr(security_dispatch_module, "WHATSAPP_ACCESS_TOKEN", "test-token")
+    monkeypatch.setattr(security_dispatch_module, "WHATSAPP_RECIPIENT", "27826502010")
+
+    sent: list[str] = []
+
+    def fake_send(notification, dispatch):
+        sent.append(notification["notification_id"])
+        return {
+            "provider": "Meta WhatsApp Cloud API",
+            "message_id": "wamid.test",
+            "recipient": "+27826502010",
+            "template": None,
+            "message_type": "text",
+            "accepted": True,
+            "raw": {"messages": [{"id": "wamid.test"}]},
+        }
+
+    monkeypatch.setattr(security_dispatch_module, "_send_whatsapp_template", fake_send)
+    client = TestClient(app)
+    created = client.post("/api/security/dispatch/test-alert")
+
+    assert created.status_code == 200
+    payload = created.json()
+    assert payload["auto_whatsapp"]["status"] == "SENT_TO_PROVIDER"
+    assert payload["auto_whatsapp"]["billing_guard"] == "SERVICE_TEXT_ONLY"
+    assert len(sent) == 1
+
+    with connect() as db:
+        statuses = [row["status"] for row in db.execute(
+            "SELECT status FROM security_notifications WHERE dispatch_id=? ORDER BY created_at",
+            (payload["dispatch_id"],),
+        ).fetchall()]
+        auto_events = db.execute(
+            "SELECT COUNT(*) FROM security_activity WHERE event_type='WHATSAPP_AUTO_SENT'"
+        ).fetchone()[0]
+    assert statuses.count("SENT_TO_PROVIDER") == 1
+    assert statuses.count("QUEUED_LOCAL") == 2
+    assert auto_events == 1
