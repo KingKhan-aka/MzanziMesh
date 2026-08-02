@@ -6,6 +6,13 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+except ImportError:
+    pass
+
 from sentinel_ops.alerts import evaluate_alert
 from sentinel_ops.aws_status import aws_status
 from sentinel_ops.camera_bridge import camera_ai_to_operations

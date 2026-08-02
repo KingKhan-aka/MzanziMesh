@@ -16,3 +16,4 @@ openpyxl>=3.1,<4          # xlsx reader
 
 # --- camera intake + evidence patterns ---
 python-multipart>=0.0.9   # file upload for /api/cameras/upload
+python-dotenv>=1,<2       # local secrets and provider configuration from .env
