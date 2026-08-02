@@ -190,19 +190,21 @@ def _send_whatsapp_template(notification: dict[str, Any], dispatch: dict[str, An
         f"{float(dispatch.get('eta_minutes') or 0):.1f}",
         str(dispatch.get("dispatch_id") or notification.get("dispatch_id") or "pending"),
     ]
+    template_payload: dict[str, Any] = {
+        "name": WHATSAPP_TEMPLATE_NAME,
+        "language": {"code": WHATSAPP_TEMPLATE_LANGUAGE},
+    }
+    if WHATSAPP_TEMPLATE_NAME != "hello_world":
+        template_payload["components"] = [{
+            "type": "body",
+            "parameters": [{"type": "text", "text": value} for value in parameters],
+        }]
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
         "to": WHATSAPP_RECIPIENT,
         "type": "template",
-        "template": {
-            "name": WHATSAPP_TEMPLATE_NAME,
-            "language": {"code": WHATSAPP_TEMPLATE_LANGUAGE},
-            "components": [{
-                "type": "body",
-                "parameters": [{"type": "text", "text": value} for value in parameters],
-            }],
-        },
+        "template": template_payload,
     }
     request = Request(
         f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages",
