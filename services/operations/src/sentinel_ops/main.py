@@ -32,6 +32,7 @@ from sentinel_ops.community_api import (
 )
 from sentinel_ops.enrichment import fuse_operational_context
 from sentinel_ops.evidence import compare_events
+from sentinel_ops.evidence_passport import router as evidence_passport_router
 from sentinel_ops.feedback_api import initialise_feedback_store
 from sentinel_ops.feedback_api import router as feedback_router
 from sentinel_ops.ingestion import ingest_claim, ingest_event
@@ -52,7 +53,12 @@ from sentinel_ops.models import (
     ReconstructRequest,
 )
 from sentinel_ops.patterns_api import router as patterns_router
-from sentinel_ops.performance import performance_snapshot, reset_metrics
+from sentinel_ops.performance import (
+    ClientMetric,
+    performance_snapshot,
+    record_client_metric,
+    reset_metrics,
+)
 from sentinel_ops.rewind import reconstruct_incident
 from sentinel_ops.roles_api import router as roles_router
 from sentinel_ops.routing import optimise_patrol
@@ -115,6 +121,7 @@ app.include_router(claims_case_router)
 app.include_router(security_dispatch_router)
 app.include_router(feedback_router)
 app.include_router(community_router)
+app.include_router(evidence_passport_router)
 
 
 @app.on_event("startup")
@@ -149,6 +156,16 @@ def get_performance():
 def clear_performance():
     reset_metrics()
     return performance_snapshot()
+
+
+@app.post("/api/performance/record")
+def post_performance_metric(metric: ClientMetric):
+    """Record a measured browser round trip from a small, approved metric set."""
+    try:
+        record_client_metric(metric)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"recorded": True, "name": metric.name, "milliseconds": metric.milliseconds}
 
 
 @app.get("/api/claims/metros")

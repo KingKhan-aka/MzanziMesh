@@ -16,8 +16,8 @@ from .colour import appearance_colours, dominant_colour
 from .config import AppConfig, ModeConfig
 from .detection import Detection, contains
 from .detectors import FaceSystem, ObjectDetector, PlateSystem
-from .detectors.plate import OCRResult, display_plate, normalize_plate
-from .quality import TrustResult, calculate_trust
+from .detectors.plate import OCRResult, display_plate, normalize_plate, vote_ocr_results
+from .quality import TrustResult, calculate_trust, evidence_policy_for_trust
 from .schemas import (
     AppearanceEvidence,
     BoundingBox,
@@ -82,19 +82,30 @@ class CandidateBucket:
     best: Candidate
     observations: int = 1
     last_timestamp: datetime | None = None
+    ocr_observations: list[OCRResult] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.last_timestamp is None:
             self.last_timestamp = self.best.timestamp
+        if self.best.plate_ocr.text:
+            self.ocr_observations.append(self.best.plate_ocr)
 
     def add(self, candidate: Candidate) -> None:
         self.observations += 1
         self.last_timestamp = candidate.timestamp
+        if candidate.plate_ocr.text:
+            self.ocr_observations.append(candidate.plate_ocr)
         if candidate.quality_rank > self.best.quality_rank:
             candidate.observations = self.observations
             self.best = candidate
         else:
             self.best.observations = self.observations
+        if self.ocr_observations:
+            self.best.plate_ocr = vote_ocr_results(
+                self.ocr_observations,
+                minimum_length=4,
+                maximum_length=10,
+            )
 
 
 class CameraAIPipeline:
@@ -514,6 +525,18 @@ class CameraAIPipeline:
                     if candidate.plate_ocr.text
                     else None
                 ),
+                ocr_frame_count=(
+                    candidate.plate_ocr.observations
+                    if candidate.plate_ocr.text
+                    else 0
+                ),
+                character_confidences=candidate.plate_ocr.character_confidences,
+                ocr_alternatives=candidate.plate_ocr.alternatives,
+                consensus_method=(
+                    "CONFIDENCE_WEIGHTED_CHARACTER_VOTE"
+                    if candidate.plate_ocr.consensus
+                    else "SINGLE_FRAME"
+                ),
             )
 
         face_confidence = (
@@ -560,6 +583,17 @@ class CameraAIPipeline:
                 "observation_count": candidate.observations,
                 "plate_raw_text": candidate.plate_ocr.raw_text,
                 "ocr_backend": candidate.plate_ocr.backend,
+                "ocr_consensus": {
+                    "frames": candidate.plate_ocr.observations,
+                    "character_confidences": candidate.plate_ocr.character_confidences,
+                    "alternatives": candidate.plate_ocr.alternatives,
+                    "method": (
+                        "CONFIDENCE_WEIGHTED_CHARACTER_VOTE"
+                        if candidate.plate_ocr.consensus
+                        else "SINGLE_FRAME"
+                    ),
+                },
+                "evidence_policy": evidence_policy_for_trust(candidate.trust.score),
                 "vehicle_colour_confidence": candidate.vehicle_colour_confidence,
                 "quality_raw": candidate.trust.raw,
                 "model_notes": candidate.model_notes,

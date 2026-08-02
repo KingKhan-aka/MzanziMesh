@@ -6,6 +6,7 @@ from difflib import SequenceMatcher
 
 from sentinel_ops.geo import haversine_km
 from sentinel_ops.models import CameraEvent, EvidenceLink
+from sentinel_ops.trust_policy import evidence_policy_for_trust
 
 
 def _norm(value: str | None) -> str:
@@ -59,10 +60,13 @@ def compare_events(first: CameraEvent, second: CameraEvent) -> EvidenceLink:
             second.face.reference_token,
         )
     face_confidence = min(first.face.confidence, second.face.confidence)
-    face = 25 * face_similarity * max(
+    raw_face = 25 * face_similarity * max(
         face_confidence,
         0.5 if face_similarity else 0,
     )
+    trust_floor = min(first.camera_trust_score, second.camera_trust_score)
+    policy = evidence_policy_for_trust(trust_floor)
+    face = raw_face if policy["biometric_escalation_enabled"] else 0.0
 
     vehicle_similarity = (
         0.45 * _same(first.vehicle.colour, second.vehicle.colour)
@@ -97,10 +101,14 @@ def compare_events(first: CameraEvent, second: CameraEvent) -> EvidenceLink:
     journey = 10.0 if journey_plausible else 0.0
 
     trust = (first.camera_trust_score + second.camera_trust_score) / 200
-    score = round(
-        (plate + face + vehicle + appearance + journey)
-        * (0.65 + 0.35 * trust),
-        1,
+    score = (
+        0.0
+        if policy["metadata_only"]
+        else round(
+            (plate + face + vehicle + appearance + journey)
+            * (0.65 + 0.35 * trust),
+            1,
+        )
     )
 
     reasons: list[str] = []
@@ -110,6 +118,10 @@ def compare_events(first: CameraEvent, second: CameraEvent) -> EvidenceLink:
         reasons.append("Partial plate agreement")
     if face >= 15:
         reasons.append("Face signal supports human review")
+    elif raw_face > 0 and not policy["biometric_escalation_enabled"]:
+        reasons.append(
+            f"Face signal retained as metadata but disabled by the {policy['band']} trust gate"
+        )
     if vehicle >= 9:
         reasons.append("Vehicle attributes agree")
     if appearance >= 6:
@@ -119,10 +131,12 @@ def compare_events(first: CameraEvent, second: CameraEvent) -> EvidenceLink:
         if journey_plausible
         else "Journey timing is implausible"
     )
-    if min(first.camera_trust_score, second.camera_trust_score) < 55:
-        reasons.append("At least one camera has low trust")
+    if trust_floor < 85:
+        reasons.append(f"Trust policy: {policy['label']}")
 
-    if score >= 75:
+    if policy["metadata_only"]:
+        relationship = "WEAK_CONNECTION"
+    elif score >= 75:
         relationship = "HIGH_PRIORITY_REVIEW"
     elif plate >= 18 or vehicle >= 10:
         relationship = "POSSIBLE_SAME_VEHICLE"
@@ -139,10 +153,14 @@ def compare_events(first: CameraEvent, second: CameraEvent) -> EvidenceLink:
         components={
             "plate": round(plate, 1),
             "face": round(face, 1),
+            "face_raw_metadata": round(raw_face, 1),
             "vehicle": round(vehicle, 1),
             "appearance": round(appearance, 1),
             "journey": journey,
             "camera_trust": round(trust * 100, 1),
+            "trust_floor": round(trust_floor, 1),
+            "biometric_escalation_enabled": float(policy["biometric_escalation_enabled"]),
+            "alert_enabled": float(policy["alert_enabled"]),
         },
         reasons=reasons or ["No strong relationship found"],
         journey_distance_km=round(distance, 3),

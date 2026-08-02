@@ -18,6 +18,38 @@ class TrustResult:
     raw: dict[str, float]
 
 
+def evidence_policy_for_trust(score: float | int) -> dict[str, object]:
+    """Map a camera trust score to the finals P1 evidence gate."""
+    trust = max(0.0, min(100.0, float(score)))
+    if trust >= 85:
+        band, label = "STRONG", "All evidence enabled"
+        height, biometric, alert, metadata, disabled = True, True, True, False, []
+    elif trust >= 70:
+        band, label = "USABLE", "Height disabled"
+        height, biometric, alert, metadata = False, True, True, False
+        disabled = ["HEIGHT_ESTIMATION"]
+    elif trust >= 50:
+        band, label = "WEAK", "Biometric escalation disabled"
+        height, biometric, alert, metadata = False, False, True, False
+        disabled = ["HEIGHT_ESTIMATION", "BIOMETRIC_ESCALATION"]
+    else:
+        band, label = "METADATA_ONLY", "Metadata only — alerts blocked"
+        height, biometric, alert, metadata = False, False, False, True
+        disabled = ["HEIGHT_ESTIMATION", "BIOMETRIC_ESCALATION", "ALERT_ESCALATION"]
+    return {
+        "trust_score": round(trust, 1),
+        "band": band,
+        "label": label,
+        "height_enabled": height,
+        "biometric_escalation_enabled": biometric,
+        "alert_enabled": alert,
+        "metadata_only": metadata,
+        "disabled_evidence": disabled,
+        "raw_evidence_retained": True,
+        "human_review_required": True,
+    }
+
+
 def sharpness_score(frame: np.ndarray) -> tuple[int, float]:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
@@ -138,4 +170,3 @@ def calculate_trust(
             "mean_brightness": round(mean_brightness, 2),
         },
     )
-

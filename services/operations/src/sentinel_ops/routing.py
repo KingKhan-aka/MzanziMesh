@@ -45,6 +45,23 @@ def _metrics(request: PatrolRequest, order: list[str]) -> RouteMetrics:
         )
         for hotspot in request.hotspots
     )
+    # "Peak risk" is the operationally high-priority band used elsewhere in the
+    # security workspace. If a small fixture has no score above 60, use its
+    # single highest-priority hotspot so the metric remains meaningful.
+    priorities = {
+        hotspot.hotspot_id: (
+            hotspot.operational_priority
+            if hotspot.operational_priority is not None
+            else hotspot.risk_score
+        )
+        for hotspot in request.hotspots
+    }
+    peak_ids = {hotspot_id for hotspot_id, score in priorities.items() if score >= 60}
+    if not peak_ids and priorities:
+        peak_ids = {max(priorities, key=priorities.get)}
+    peak_total = sum(priorities[hotspot_id] for hotspot_id in peak_ids)
+    covered_peak_ids = peak_ids.intersection(order)
+    peak_covered = sum(priorities[hotspot_id] for hotspot_id in covered_peak_ids)
     return RouteMetrics(
         ordered_hotspot_ids=order,
         distance_km=round(distance, 3),
@@ -55,6 +72,11 @@ def _metrics(request: PatrolRequest, order: list[str]) -> RouteMetrics:
         risk_covered=round(risk, 1),
         coverage_percent=round(100 * risk / total_risk, 1) if total_risk else 0,
         protected_risk_per_km=round(risk / distance, 3) if distance else 0,
+        peak_risk_covered=round(peak_covered, 1),
+        peak_risk_coverage_percent=(
+            round(100 * peak_covered / peak_total, 1) if peak_total else 0
+        ),
+        peak_risk_stops=len(covered_peak_ids),
     )
 
 
@@ -156,4 +178,17 @@ def optimise_patrol(request: PatrolRequest) -> PatrolComparison:
             3,
         ),
         protected_risk_per_km_improvement_percent=round(improvement, 1),
+        coverage_change_points=round(
+            optimised_metrics.coverage_percent - base_metrics.coverage_percent,
+            1,
+        ),
+        peak_risk_coverage_change_points=round(
+            optimised_metrics.peak_risk_coverage_percent
+            - base_metrics.peak_risk_coverage_percent,
+            1,
+        ),
+        peak_risk_retained=(
+            optimised_metrics.peak_risk_coverage_percent
+            >= base_metrics.peak_risk_coverage_percent
+        ),
     )

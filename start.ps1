@@ -10,7 +10,8 @@ param(
     [switch]$Fresh,
     [int]$Port = 8000,
     [int]$ChatPort = 8082,
-    [switch]$NoChat
+    [switch]$NoChat,
+    [switch]$SkipOcrInstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -62,10 +63,37 @@ if ($needInstall) {
     Write-Host "  dependencies  already installed" -ForegroundColor DarkGray
 }
 
-# --- optional extras --------------------------------------------------------
-if (-not (Get-Command tesseract -ErrorAction SilentlyContinue)) {
-    Write-Host "  tesseract  not on PATH - licence-plate OCR will fall back" -ForegroundColor Yellow
-    Write-Host "             (everything else works; install Tesseract 5 to enable it)" -ForegroundColor DarkGray
+# --- plate OCR --------------------------------------------------------------
+function Find-TesseractExecutable {
+    $command = Get-Command tesseract -ErrorAction SilentlyContinue
+    $candidates = @(
+        if ($env:TESSERACT_CMD) { $env:TESSERACT_CMD }
+        if ($command) { $command.Source }
+        "$env:ProgramFiles\Tesseract-OCR\tesseract.exe"
+        "${env:ProgramFiles(x86)}\Tesseract-OCR\tesseract.exe"
+        "$env:LOCALAPPDATA\Programs\Tesseract-OCR\tesseract.exe"
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+    return $candidates | Select-Object -First 1
+}
+
+$tesseractPath = Find-TesseractExecutable
+if (-not $tesseractPath -and -not $SkipOcrInstall) {
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host "  plate OCR  Tesseract missing - installing it now ..." -ForegroundColor Yellow
+        & winget install --id UB-Mannheim.TesseractOCR -e --silent `
+            --accept-package-agreements --accept-source-agreements --disable-interactivity
+        $tesseractPath = Find-TesseractExecutable
+    }
+}
+
+if ($tesseractPath) {
+    $env:TESSERACT_CMD = $tesseractPath
+    Write-Host "  plate OCR  Tesseract ready: $tesseractPath" -ForegroundColor Green
+} else {
+    Write-Host "  plate OCR  DISABLED - Tesseract 5 is not installed" -ForegroundColor Red
+    Write-Host "             Run: winget install --id UB-Mannheim.TesseractOCR -e" -ForegroundColor Yellow
+    Write-Host "             Then close this terminal and run .\start.ps1 -Fresh again." -ForegroundColor Yellow
 }
 
 # --- run --------------------------------------------------------------------

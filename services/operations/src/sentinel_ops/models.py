@@ -52,6 +52,7 @@ class CameraEvent(BaseModel):
     vehicle: VehicleSignal = Field(default_factory=VehicleSignal)
     appearance: AppearanceSignal = Field(default_factory=AppearanceSignal)
     camera_trust_score: float = Field(default=50.0, ge=0, le=100)
+    evidence_policy: dict = Field(default_factory=dict)
     source: str = "demo"
 
 
@@ -127,6 +128,7 @@ class Alert(BaseModel):
     evidence_score: float
     reasons: list[str]
     human_review_required: bool = True
+    evidence_policy: dict = Field(default_factory=dict)
 
 
 class ReconstructRequest(BaseModel):
@@ -139,11 +141,14 @@ class ReconstructRequest(BaseModel):
 
 class TimelineItem(BaseModel):
     event_id: str
+    camera_id: str | None = None
     timestamp: datetime
     distance_from_claim_km: float
     relevance_score: float = Field(ge=0, le=100)
     description: str
     media_url: str | None = None
+    evidence_signals: list[str] = Field(default_factory=list)
+    camera_trust_score: float | None = Field(default=None, ge=0, le=100)
 
 
 class IncidentTimeline(BaseModel):
@@ -170,6 +175,9 @@ class RouteMetrics(BaseModel):
     risk_covered: float
     coverage_percent: float
     protected_risk_per_km: float
+    peak_risk_covered: float = 0.0
+    peak_risk_coverage_percent: float = 0.0
+    peak_risk_stops: int = 0
 
 
 class PatrolComparison(BaseModel):
@@ -178,6 +186,9 @@ class PatrolComparison(BaseModel):
     distance_saved_km: float
     fuel_saved_litres: float
     protected_risk_per_km_improvement_percent: float
+    coverage_change_points: float = 0.0
+    peak_risk_coverage_change_points: float = 0.0
+    peak_risk_retained: bool = False
 
 
 class EnrichmentRow(BaseModel):

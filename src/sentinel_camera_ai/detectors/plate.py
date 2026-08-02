@@ -4,7 +4,9 @@ import json
 import logging
 import os
 import shutil
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import cv2
@@ -256,6 +258,124 @@ class OCRResult:
     confidence: float
     backend: str
     raw_text: str | None = None
+    observations: int = 1
+    character_confidences: list[float] = field(default_factory=list)
+    alternatives: list[dict[str, object]] = field(default_factory=list)
+    consensus: bool = False
+
+
+def _aligned_characters(reference: str, observed: str) -> dict[int, str]:
+    """Align a noisy OCR string to reference positions without padding guesses."""
+    aligned: dict[int, str] = {}
+    matcher = SequenceMatcher(a=reference, b=observed, autojunk=False)
+    for tag, a1, a2, b1, b2 in matcher.get_opcodes():
+        if tag in {"equal", "replace"}:
+            for offset in range(min(a2 - a1, b2 - b1)):
+                aligned[a1 + offset] = observed[b1 + offset]
+    return aligned
+
+
+def vote_ocr_results(
+    observations: list[OCRResult],
+    *,
+    minimum_length: int = 4,
+    maximum_length: int = 10,
+) -> OCRResult:
+    """Create a confidence-weighted, per-character vote across real frames.
+
+    A medoid observation supplies only the alignment length; every output character
+    is chosen from weighted observed characters.  Missing/extra blur characters do
+    not shift the rest of the plate, and alternatives remain visible for audit.
+    """
+    usable = [
+        item
+        for item in observations
+        if minimum_length <= len(normalize_plate(item.text)) <= maximum_length
+    ]
+    if not usable:
+        return OCRResult(None, 0.0, "multi-frame OCR vote", observations=0, consensus=True)
+    if len(usable) == 1:
+        single = usable[0]
+        text = normalize_plate(single.text)
+        return OCRResult(
+            text,
+            single.confidence,
+            single.backend,
+            single.raw_text,
+            observations=1,
+            character_confidences=[round(single.confidence, 3)] * len(text),
+            alternatives=[{"text": text, "frames": 1, "weight": round(single.confidence, 3)}],
+            consensus=False,
+        )
+
+    texts = [normalize_plate(item.text) for item in usable]
+    reference_index = max(
+        range(len(usable)),
+        key=lambda index: sum(
+            SequenceMatcher(a=texts[index], b=other, autojunk=False).ratio()
+            * max(0.15, usable[other_index].confidence)
+            for other_index, other in enumerate(texts)
+        ),
+    )
+    reference = texts[reference_index]
+    relevant = [
+        (item, text)
+        for item, text in zip(usable, texts)
+        if SequenceMatcher(a=reference, b=text, autojunk=False).ratio() >= 0.50
+    ] or [(usable[reference_index], reference)]
+
+    position_votes: list[dict[str, float]] = [defaultdict(float) for _ in reference]
+    position_totals = [0.0 for _ in reference]
+    alternative_weights: dict[str, float] = defaultdict(float)
+    alternative_frames: dict[str, int] = defaultdict(int)
+    for item, text in relevant:
+        weight = max(0.15, min(1.0, float(item.confidence)))
+        alternative_weights[text] += weight
+        alternative_frames[text] += 1
+        for position, character in _aligned_characters(reference, text).items():
+            position_votes[position][character] += weight
+            position_totals[position] += weight
+
+    characters: list[str] = []
+    character_confidences: list[float] = []
+    for position, votes in enumerate(position_votes):
+        if not votes:
+            character = reference[position]
+            confidence = max(0.15, usable[reference_index].confidence * 0.55)
+        else:
+            character, winner_weight = max(votes.items(), key=lambda item: item[1])
+            confidence = winner_weight / max(position_totals[position], 1e-9)
+        characters.append(character)
+        character_confidences.append(round(min(1.0, confidence), 3))
+    consensus_text = "".join(characters)
+    agreement = sum(
+        SequenceMatcher(a=consensus_text, b=text, autojunk=False).ratio()
+        for _, text in relevant
+    ) / len(relevant)
+    mean_character = sum(character_confidences) / max(len(character_confidences), 1)
+    mean_engine = sum(item.confidence for item, _ in relevant) / len(relevant)
+    confidence = min(0.99, 0.45 * mean_character + 0.35 * agreement + 0.20 * mean_engine)
+    alternatives = [
+        {
+            "text": text,
+            "frames": alternative_frames[text],
+            "weight": round(weight, 3),
+        }
+        for text, weight in sorted(
+            alternative_weights.items(), key=lambda item: item[1], reverse=True
+        )[:5]
+    ]
+    backends = sorted({item.backend for item, _ in relevant if item.backend})
+    return OCRResult(
+        text=consensus_text,
+        confidence=round(confidence, 3),
+        backend=f"multi-frame vote ({' + '.join(backends) or 'OCR'})",
+        raw_text=" | ".join(text for _, text in relevant),
+        observations=len(relevant),
+        character_confidences=character_confidences,
+        alternatives=alternatives,
+        consensus=True,
+    )
 
 
 class TesseractPlateOCR:

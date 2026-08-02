@@ -124,9 +124,12 @@ def load_claims_hotspots(metro: str | None = None) -> tuple[list[Hotspot], dict[
         "live_branch_output": live,
         "source": "cassoojee-live" if live else "cassoojee-snapshot",
         "note": (
-            "SAPS values in the supplied claims output are historical corroboration, "
-            "not a live SAPS incident feed."
+            "Operational scores use audited SAPS 2025/26 station totals; the "
+            "2008/09-2024/25 series is contextual and not a live incident feed."
         ),
+        "saps_current_period": "2025/2026",
+        "saps_history_period": "2008/2009-2024/2025",
+        "history_affects_live_score": False,
     }
     return hotspots, metadata
 

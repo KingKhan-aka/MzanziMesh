@@ -15,10 +15,12 @@ import config
 def fuse():
     hotspots = json.loads((config.CURATED_DIR / "hotspots.json").read_text(encoding="utf-8"))
 
-    saps = pd.read_csv(config.PARTNER_DIR / "saps_theft_by_station.csv")
-    saps["STATION"] = saps["Police Station"].str.upper().str.strip()
-    latest_year = sorted(saps["Year"].unique())[-1]
-    recent = saps[saps["Year"] == latest_year]
+    saps = pd.read_csv(config.PARTNER_DIR / "saps_2025_2026_by_station_crime.csv")
+    saps["Incidents"] = pd.to_numeric(saps["Incidents"], errors="raise").clip(lower=0)
+    saps["STATION"] = saps["Station"].str.upper().str.strip()
+    latest_year = "2025/2026"
+    theft_categories = ["Theft of motor vehicle and motorcycle", "Theft out of or from motor vehicle"]
+    recent = saps[saps["Crime_Category"].isin(theft_categories)]
     station_theft = recent.groupby("STATION")["Incidents"].sum()
 
     # SAPS theft for each pilot suburb via its station

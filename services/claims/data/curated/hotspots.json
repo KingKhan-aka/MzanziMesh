@@ -22,12 +22,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Claremont",
-      "theft_incidents": 1413,
-      "theft_year": "2016-2017",
-      "saps_score": 5.2,
+      "theft_incidents": 452,
+      "theft_year": "2025/2026",
+      "saps_score": 9.7,
       "corroborated": false
     },
-    "blended_risk_score": 60.9,
+    "blended_risk_score": 62.3,
     "contributions_pct": {
       "frequency": 50.4,
       "severity": 23.0,
@@ -48,15 +48,26 @@
       "station": "Claremont",
       "matched_peril": "Home Invasion",
       "matched_categories": {
-        "Burglary at residential premises": 636,
-        "Robbery at residential premises": 32
+        "Burglary at residential premises": 107,
+        "Robbery at residential premises": 10
       },
-      "matched_total": 668,
-      "saps_typed_score": 2.0,
+      "matched_total": 117,
+      "saps_typed_score": 0.0,
       "corroborated": false,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 64.1
+    "blended_risk_v2": 63.6,
+    "saps_historical": {
+      "station": "Claremont",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 624,
+      "five_year_average": 952.2,
+      "five_year_change_pct": -43.1,
+      "trend": "DECREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H002",
@@ -81,12 +92,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Somerset West",
-      "theft_incidents": 1467,
-      "theft_year": "2016-2017",
-      "saps_score": 6.5,
+      "theft_incidents": 283,
+      "theft_year": "2025/2026",
+      "saps_score": 0.0,
       "corroborated": false
     },
-    "blended_risk_score": 61.2,
+    "blended_risk_score": 59.3,
     "contributions_pct": {
       "frequency": 53.2,
       "severity": 25.9,
@@ -107,15 +118,26 @@
       "station": "Somerset West",
       "matched_peril": "Home Invasion",
       "matched_categories": {
-        "Burglary at residential premises": 924,
-        "Robbery at residential premises": 22
+        "Burglary at residential premises": 296,
+        "Robbery at residential premises": 33
       },
-      "matched_total": 946,
-      "saps_typed_score": 10.5,
+      "matched_total": 329,
+      "saps_typed_score": 11.0,
       "corroborated": false,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 66.2
+    "blended_risk_v2": 66.3,
+    "saps_historical": {
+      "station": "Somerset West",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 872,
+      "five_year_average": 845.6,
+      "five_year_change_pct": 7.0,
+      "trend": "INCREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H003",
@@ -140,12 +162,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Sandton",
-      "theft_incidents": 2410,
-      "theft_year": "2016-2017",
-      "saps_score": 28.4,
+      "theft_incidents": 661,
+      "theft_year": "2025/2026",
+      "saps_score": 21.7,
       "corroborated": true
     },
-    "blended_risk_score": 67.3,
+    "blended_risk_score": 65.3,
     "contributions_pct": {
       "frequency": 43.0,
       "severity": 34.0,
@@ -166,15 +188,26 @@
       "station": "Sandton",
       "matched_peril": "Home Invasion",
       "matched_categories": {
-        "Burglary at residential premises": 758,
-        "Robbery at residential premises": 245
+        "Burglary at residential premises": 261,
+        "Robbery at residential premises": 95
       },
-      "matched_total": 1003,
-      "saps_typed_score": 12.2,
-      "corroborated": true,
-      "year": "2015-2016"
+      "matched_total": 356,
+      "saps_typed_score": 12.4,
+      "corroborated": false,
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 66.0
+    "blended_risk_v2": 66.1,
+    "saps_historical": {
+      "station": "Sandton",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 1250,
+      "five_year_average": 1248.6,
+      "five_year_change_pct": 12.5,
+      "trend": "INCREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H004",
@@ -199,12 +232,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Claremont",
-      "theft_incidents": 1413,
-      "theft_year": "2016-2017",
-      "saps_score": 5.2,
+      "theft_incidents": 452,
+      "theft_year": "2025/2026",
+      "saps_score": 9.7,
       "corroborated": false
     },
-    "blended_risk_score": 53.6,
+    "blended_risk_score": 54.9,
     "contributions_pct": {
       "frequency": 38.3,
       "severity": 33.2,
@@ -225,15 +258,26 @@
       "station": "Claremont",
       "matched_peril": "Home Invasion",
       "matched_categories": {
-        "Burglary at residential premises": 636,
-        "Robbery at residential premises": 32
+        "Burglary at residential premises": 107,
+        "Robbery at residential premises": 10
       },
-      "matched_total": 668,
-      "saps_typed_score": 2.0,
+      "matched_total": 117,
+      "saps_typed_score": 0.0,
       "corroborated": false,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 56.2
+    "blended_risk_v2": 55.7,
+    "saps_historical": {
+      "station": "Claremont",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 624,
+      "five_year_average": 952.2,
+      "five_year_change_pct": -43.1,
+      "trend": "DECREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H005",
@@ -258,8 +302,8 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Cape Town Central",
-      "theft_incidents": 5496,
-      "theft_year": "2016-2017",
+      "theft_incidents": 2026,
+      "theft_year": "2025/2026",
       "saps_score": 100.0,
       "corroborated": true
     },
@@ -284,16 +328,27 @@
       "station": "Cape Town Central",
       "matched_peril": "Vehicle Theft",
       "matched_categories": {
-        "Theft of motor vehicle and motorcycle": 345,
-        "Carjacking": 13,
-        "Theft out of or from motor vehicle": 3509
+        "Theft of motor vehicle and motorcycle": 155,
+        "Carjacking": 16,
+        "Theft out of or from motor vehicle": 1871
       },
-      "matched_total": 3867,
+      "matched_total": 2042,
       "saps_typed_score": 100.0,
       "corroborated": true,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 73.7
+    "blended_risk_v2": 73.7,
+    "saps_historical": {
+      "station": "Cape Town Central",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 2955,
+      "five_year_average": 2843.2,
+      "five_year_change_pct": 46.6,
+      "trend": "INCREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H006",
@@ -318,8 +373,8 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Cape Town Central",
-      "theft_incidents": 5496,
-      "theft_year": "2016-2017",
+      "theft_incidents": 2026,
+      "theft_year": "2025/2026",
       "saps_score": 100.0,
       "corroborated": true
     },
@@ -344,16 +399,27 @@
       "station": "Cape Town Central",
       "matched_peril": "Vehicle Theft",
       "matched_categories": {
-        "Theft of motor vehicle and motorcycle": 345,
-        "Carjacking": 13,
-        "Theft out of or from motor vehicle": 3509
+        "Theft of motor vehicle and motorcycle": 155,
+        "Carjacking": 16,
+        "Theft out of or from motor vehicle": 1871
       },
-      "matched_total": 3867,
+      "matched_total": 2042,
       "saps_typed_score": 100.0,
       "corroborated": true,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 70.8
+    "blended_risk_v2": 70.8,
+    "saps_historical": {
+      "station": "Cape Town Central",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 2955,
+      "five_year_average": 2843.2,
+      "five_year_change_pct": 46.6,
+      "trend": "INCREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H007",
@@ -378,12 +444,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Brooklyn",
-      "theft_incidents": 2045,
-      "theft_year": "2016-2017",
-      "saps_score": 19.9,
+      "theft_incidents": 1066,
+      "theft_year": "2025/2026",
+      "saps_score": 44.9,
       "corroborated": true
     },
-    "blended_risk_score": 46.6,
+    "blended_risk_score": 54.1,
     "contributions_pct": {
       "frequency": 24.9,
       "severity": 51.9,
@@ -404,16 +470,27 @@
       "station": "Brooklyn",
       "matched_peril": "Vehicle Theft",
       "matched_categories": {
-        "Theft of motor vehicle and motorcycle": 529,
-        "Carjacking": 10,
-        "Theft out of or from motor vehicle": 1063
+        "Theft of motor vehicle and motorcycle": 624,
+        "Carjacking": 18,
+        "Theft out of or from motor vehicle": 442
       },
-      "matched_total": 1602,
-      "saps_typed_score": 30.6,
+      "matched_total": 1084,
+      "saps_typed_score": 50.2,
       "corroborated": true,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 51.1
+    "blended_risk_v2": 56.0,
+    "saps_historical": {
+      "station": "Brooklyn",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 1891,
+      "five_year_average": 2060.6,
+      "five_year_change_pct": -11.6,
+      "trend": "DECREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H008",
@@ -438,12 +515,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Claremont",
-      "theft_incidents": 1413,
-      "theft_year": "2016-2017",
-      "saps_score": 5.2,
+      "theft_incidents": 452,
+      "theft_year": "2025/2026",
+      "saps_score": 9.7,
       "corroborated": false
     },
-    "blended_risk_score": 40.3,
+    "blended_risk_score": 41.7,
     "contributions_pct": {
       "frequency": 57.8,
       "severity": 12.5,
@@ -464,15 +541,26 @@
       "station": "Claremont",
       "matched_peril": "Home Invasion",
       "matched_categories": {
-        "Burglary at residential premises": 636,
-        "Robbery at residential premises": 32
+        "Burglary at residential premises": 107,
+        "Robbery at residential premises": 10
       },
-      "matched_total": 668,
-      "saps_typed_score": 2.0,
+      "matched_total": 117,
+      "saps_typed_score": 0.0,
       "corroborated": false,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 42.0
+    "blended_risk_v2": 41.5,
+    "saps_historical": {
+      "station": "Claremont",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 624,
+      "five_year_average": 952.2,
+      "five_year_change_pct": -43.1,
+      "trend": "DECREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H009",
@@ -497,12 +585,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Douglasdale",
-      "theft_incidents": 1591,
-      "theft_year": "2016-2017",
-      "saps_score": 9.4,
-      "corroborated": true
+      "theft_incidents": 438,
+      "theft_year": "2025/2026",
+      "saps_score": 8.9,
+      "corroborated": false
     },
-    "blended_risk_score": 39.7,
+    "blended_risk_score": 39.6,
     "contributions_pct": {
       "frequency": 26.5,
       "severity": 31.9,
@@ -511,28 +599,39 @@
     },
     "primary_driver": "severity",
     "confidence": {
-      "score": 75,
-      "band": "HIGH",
+      "score": 55,
+      "band": "MEDIUM",
       "inputs": {
         "volume": 0.52,
         "timestamp_reliability": 0.95,
-        "saps_corroborated": true
+        "saps_corroborated": false
       }
     },
     "saps_typed": {
       "station": "Douglasdale",
       "matched_peril": "Vehicle Theft",
       "matched_categories": {
-        "Theft of motor vehicle and motorcycle": 203,
-        "Carjacking": 44,
-        "Theft out of or from motor vehicle": 737
+        "Theft of motor vehicle and motorcycle": 108,
+        "Carjacking": 71,
+        "Theft out of or from motor vehicle": 330
       },
-      "matched_total": 984,
-      "saps_typed_score": 11.6,
+      "matched_total": 509,
+      "saps_typed_score": 20.4,
       "corroborated": true,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 42.4
+    "blended_risk_v2": 44.6,
+    "saps_historical": {
+      "station": "Douglasdale",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 851,
+      "five_year_average": 943.4,
+      "five_year_change_pct": -0.1,
+      "trend": "STABLE",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H010",
@@ -557,12 +656,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Germiston",
-      "theft_incidents": 1187,
-      "theft_year": "2016-2017",
-      "saps_score": 0.0,
+      "theft_incidents": 425,
+      "theft_year": "2025/2026",
+      "saps_score": 8.1,
       "corroborated": false
     },
-    "blended_risk_score": 36.7,
+    "blended_risk_score": 39.1,
     "contributions_pct": {
       "frequency": 16.2,
       "severity": 45.6,
@@ -583,15 +682,26 @@
       "station": "Germiston",
       "matched_peril": "Home Invasion",
       "matched_categories": {
-        "Burglary at residential premises": 543,
-        "Robbery at residential premises": 61
+        "Burglary at residential premises": 220,
+        "Robbery at residential premises": 36
       },
-      "matched_total": 604,
-      "saps_typed_score": 0.0,
+      "matched_total": 256,
+      "saps_typed_score": 7.2,
       "corroborated": false,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 39.3
+    "blended_risk_v2": 41.1,
+    "saps_historical": {
+      "station": "Germiston",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 864,
+      "five_year_average": 902.8,
+      "five_year_change_pct": -7.9,
+      "trend": "DECREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H011",
@@ -616,12 +726,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Brooklyn",
-      "theft_incidents": 2045,
-      "theft_year": "2016-2017",
-      "saps_score": 19.9,
+      "theft_incidents": 1066,
+      "theft_year": "2025/2026",
+      "saps_score": 44.9,
       "corroborated": true
     },
-    "blended_risk_score": 41.3,
+    "blended_risk_score": 48.8,
     "contributions_pct": {
       "frequency": 27.5,
       "severity": 53.3,
@@ -642,15 +752,26 @@
       "station": "Brooklyn",
       "matched_peril": "Home Invasion",
       "matched_categories": {
-        "Burglary at residential premises": 831,
-        "Robbery at residential premises": 91
+        "Burglary at residential premises": 384,
+        "Robbery at residential premises": 77
       },
-      "matched_total": 922,
-      "saps_typed_score": 9.7,
-      "corroborated": false,
-      "year": "2015-2016"
+      "matched_total": 461,
+      "saps_typed_score": 17.9,
+      "corroborated": true,
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 40.3
+    "blended_risk_v2": 42.4,
+    "saps_historical": {
+      "station": "Brooklyn",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 1891,
+      "five_year_average": 2060.6,
+      "five_year_change_pct": -11.6,
+      "trend": "DECREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H012",
@@ -675,12 +796,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Brooklyn",
-      "theft_incidents": 2045,
-      "theft_year": "2016-2017",
-      "saps_score": 19.9,
+      "theft_incidents": 1066,
+      "theft_year": "2025/2026",
+      "saps_score": 44.9,
       "corroborated": true
     },
-    "blended_risk_score": 37.8,
+    "blended_risk_score": 45.2,
     "contributions_pct": {
       "frequency": 0.0,
       "severity": 61.5,
@@ -701,16 +822,27 @@
       "station": "Brooklyn",
       "matched_peril": "Vehicle Theft",
       "matched_categories": {
-        "Theft of motor vehicle and motorcycle": 529,
-        "Carjacking": 10,
-        "Theft out of or from motor vehicle": 1063
+        "Theft of motor vehicle and motorcycle": 624,
+        "Carjacking": 18,
+        "Theft out of or from motor vehicle": 442
       },
-      "matched_total": 1602,
-      "saps_typed_score": 30.6,
+      "matched_total": 1084,
+      "saps_typed_score": 50.2,
       "corroborated": true,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 41.7
+    "blended_risk_v2": 46.6,
+    "saps_historical": {
+      "station": "Brooklyn",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 1891,
+      "five_year_average": 2060.6,
+      "five_year_change_pct": -11.6,
+      "trend": "DECREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H013",
@@ -735,12 +867,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Table View",
-      "theft_incidents": 1425,
-      "theft_year": "2016-2017",
-      "saps_score": 5.5,
+      "theft_incidents": 545,
+      "theft_year": "2025/2026",
+      "saps_score": 15.0,
       "corroborated": false
     },
-    "blended_risk_score": 30.2,
+    "blended_risk_score": 33.1,
     "contributions_pct": {
       "frequency": 35.5,
       "severity": 13.3,
@@ -761,15 +893,26 @@
       "station": "Table View",
       "matched_peril": "Home Invasion",
       "matched_categories": {
-        "Burglary at residential premises": 922,
-        "Robbery at residential premises": 44
+        "Burglary at residential premises": 414,
+        "Robbery at residential premises": 39
       },
-      "matched_total": 966,
-      "saps_typed_score": 11.1,
+      "matched_total": 453,
+      "saps_typed_score": 17.5,
       "corroborated": false,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 33.4
+    "blended_risk_v2": 35.0,
+    "saps_historical": {
+      "station": "Table View",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 945,
+      "five_year_average": 918.6,
+      "five_year_change_pct": 33.5,
+      "trend": "INCREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   },
   {
     "hotspot_id": "H014",
@@ -794,12 +937,12 @@
     "formula_version": "risk-pulse-v1",
     "saps": {
       "station": "Lyttelton",
-      "theft_incidents": 1188,
-      "theft_year": "2016-2017",
-      "saps_score": 0.0,
-      "corroborated": false
+      "theft_incidents": 674,
+      "theft_year": "2025/2026",
+      "saps_score": 22.4,
+      "corroborated": true
     },
-    "blended_risk_score": 19.7,
+    "blended_risk_score": 26.4,
     "contributions_pct": {
       "frequency": 30.3,
       "severity": 44.6,
@@ -808,27 +951,38 @@
     },
     "primary_driver": "severity",
     "confidence": {
-      "score": 52,
-      "band": "MEDIUM",
+      "score": 72,
+      "band": "HIGH",
       "inputs": {
         "volume": 0.47,
         "timestamp_reliability": 0.96,
-        "saps_corroborated": false
+        "saps_corroborated": true
       }
     },
     "saps_typed": {
       "station": "Lyttelton",
       "matched_peril": "Vehicle Theft",
       "matched_categories": {
-        "Theft of motor vehicle and motorcycle": 461,
-        "Carjacking": 29,
-        "Theft out of or from motor vehicle": 1076
+        "Theft of motor vehicle and motorcycle": 258,
+        "Carjacking": 26,
+        "Theft out of or from motor vehicle": 416
       },
-      "matched_total": 1566,
-      "saps_typed_score": 29.5,
+      "matched_total": 700,
+      "saps_typed_score": 30.3,
       "corroborated": true,
-      "year": "2015-2016"
+      "year": "2025/2026"
     },
-    "blended_risk_v2": 28.5
+    "blended_risk_v2": 28.7,
+    "saps_historical": {
+      "station": "Lyttelton",
+      "available": true,
+      "latest_historical_year": "2024/2025",
+      "latest_historical_total": 1294,
+      "five_year_average": 1437.2,
+      "five_year_change_pct": -9.7,
+      "trend": "DECREASING",
+      "years_available": 17,
+      "note": "Historical context through 2024/25 only; not included in the current blended score."
+    }
   }
 ]

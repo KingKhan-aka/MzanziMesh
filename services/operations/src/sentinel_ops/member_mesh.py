@@ -45,6 +45,7 @@ from sentinel_ops.height import (
 from sentinel_ops.performance import record_metric
 from sentinel_ops.roles_api import _suburb_stats
 from sentinel_ops.storage import connect, database_path
+from sentinel_ops.trust_policy import evidence_policy_for_trust
 
 router = APIRouter(tags=["member mesh"])
 
@@ -56,7 +57,23 @@ FACE_MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 
 FACE_MATCH_THRESHOLD = float(os.getenv("SENTINEL_FACE_MATCH_THRESHOLD", "0.72"))
 FACE_MATCH_MARGIN = float(os.getenv("SENTINEL_FACE_MATCH_MARGIN", "0.035"))
-FACE_MIN_RECOGNITION_PIXELS = int(os.getenv("SENTINEL_FACE_MIN_RECOGNITION_PIXELS", "64"))
+FACE_MIN_RECOGNITION_PIXELS = int(os.getenv("SENTINEL_FACE_MIN_RECOGNITION_PIXELS", "56"))
+FACE_FAR_RETRIEVAL_MIN_PIXELS = int(
+    os.getenv("SENTINEL_FACE_FAR_RETRIEVAL_MIN_PIXELS", "42")
+)
+FACE_FAR_RETRIEVAL_THRESHOLD = float(
+    os.getenv("SENTINEL_FACE_FAR_RETRIEVAL_THRESHOLD", "0.68")
+)
+FACE_VERY_FAR_RETRIEVAL_THRESHOLD = float(
+    os.getenv("SENTINEL_FACE_VERY_FAR_RETRIEVAL_THRESHOLD", "0.72")
+)
+FACE_TRACK_CONTINUITY_THRESHOLD = float(
+    os.getenv("SENTINEL_FACE_TRACK_CONTINUITY_THRESHOLD", "0.60")
+)
+FACE_NEW_PROFILE_MIN_PIXELS = int(os.getenv("SENTINEL_FACE_NEW_PROFILE_MIN_PIXELS", "96"))
+FACE_AMBIGUOUS_RETRY_THRESHOLD = float(
+    os.getenv("SENTINEL_FACE_AMBIGUOUS_RETRY_THRESHOLD", "0.62")
+)
 MAX_FACE_UPLOAD = 5 * 1024 * 1024
 MAX_PERSON_SPEED_KMH = 25.0
 ALLOWED_PROFILE_STATUSES = {
@@ -95,8 +112,9 @@ AWS_TABLE_MAP = {
 
 # The former hot path decoded every profile BLOB and compared it in a Python loop
 # for every camera sighting.  The gallery changes rarely, so keep one normalised
-# matrix per SQLite database and invalidate it only when a profile is created,
-# split or reset.  This also keeps tests that swap SENTINEL_DATABASE_PATH isolated.
+# matrix per SQLite database. Each profile contributes its stable enrolment vector
+# plus a small recent template set, improving viewpoint tolerance without mutating
+# the enrolment vector. This also keeps tests that swap database paths isolated.
 _FACE_GALLERY_LOCK = threading.RLock()
 _FACE_GALLERY_CACHE: dict[str, Any] = {
     "database": None,
@@ -852,6 +870,14 @@ class CalibrationIn(BaseModel):
     updated_by: str = "Member demo operator"
 
 
+class SightingHeightIn(BaseModel):
+    user_id: str
+    camera_id: str
+    person_boxes: list[dict[str, float]] = Field(..., min_length=1, max_length=24)
+    image_width: int = Field(..., ge=100)
+    image_height: int = Field(..., ge=100)
+
+
 class FalseMatchIn(BaseModel):
     reason: str = Field(..., min_length=3)
     reviewer: str = "Member demo operator"
@@ -1456,9 +1482,23 @@ def _face_gallery(db: sqlite3.Connection) -> tuple[list[dict[str, Any]], np.ndar
         vectors: list[np.ndarray] = []
         for row in db.execute(
             """
-            SELECT profile_id, anonymous_label, embedding, embedding_size,
-                   sighting_count, system_status
-            FROM face_profiles
+            WITH recent_templates AS (
+                SELECT profile_id, embedding, embedding_size,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY profile_id ORDER BY captured_at DESC
+                       ) AS template_rank
+                FROM face_sightings
+                WHERE embedding IS NOT NULL AND embedding_size > 0
+            )
+            SELECT p.profile_id, p.anonymous_label, p.embedding, p.embedding_size,
+                   p.sighting_count, p.system_status, 'ENROLMENT' AS template_source
+            FROM face_profiles p
+            UNION ALL
+            SELECT p.profile_id, p.anonymous_label, r.embedding, r.embedding_size,
+                   p.sighting_count, p.system_status, 'RECENT_SIGHTING' AS template_source
+            FROM recent_templates r
+            JOIN face_profiles p ON p.profile_id=r.profile_id
+            WHERE r.template_rank <= 8
             ORDER BY profile_id
             """
         ).fetchall():
@@ -1499,17 +1539,145 @@ def _gallery_candidates(
     if norm <= 1e-12 or query.size != matrix.shape[1]:
         return None, None
     similarities = np.clip((matrix @ (query / norm) + 1.0) / 2.0, 0.0, 1.0)
-    count = min(2, similarities.size)
-    indices = np.argpartition(similarities, -count)[-count:]
-    indices = indices[np.argsort(similarities[indices])[::-1]]
-    candidates = [
-        {
-            "row": rows[int(index)],
-            "similarity": float(similarities[int(index)]),
-        }
-        for index in indices
-    ]
+    # Multiple recent templates can belong to one identity. Collapse them to the
+    # best score per profile before applying the runner-up margin, otherwise two
+    # views of the same person would incorrectly look like competing identities.
+    per_profile: dict[str, dict[str, Any]] = {}
+    for index, similarity in enumerate(similarities):
+        row = rows[index]
+        profile_id = str(row["profile_id"])
+        current = per_profile.get(profile_id)
+        if current is None or float(similarity) > current["similarity"]:
+            per_profile[profile_id] = {
+                "row": row,
+                "similarity": float(similarity),
+            }
+    candidates = sorted(
+        per_profile.values(), key=lambda item: item["similarity"], reverse=True
+    )[:2]
     return candidates[0], candidates[1] if len(candidates) > 1 else None
+
+
+def _track_continuity_candidate(
+    db: sqlite3.Connection,
+    profile_id: str | None,
+    vector: np.ndarray,
+) -> dict[str, Any] | None:
+    """Compare a live browser track with its last recognised profile only.
+
+    This hint is intentionally short-lived and supplied by the live UI. It lets a
+    person move nearer or farther from one camera without turning a scale change
+    into a new identity. Height and body measurements never participate here.
+    """
+    if not profile_id:
+        return None
+    row = db.execute(
+        """
+        SELECT profile_id, anonymous_label, embedding, embedding_size,
+               sighting_count, system_status
+        FROM face_profiles WHERE profile_id=?
+        """,
+        (profile_id,),
+    ).fetchone()
+    if not row:
+        return None
+    stored = _decode_embedding(row["embedding"], row["embedding_size"])
+    if stored is None or stored.size != vector.size:
+        return None
+    public_row = dict(row)
+    public_row.pop("embedding", None)
+    public_row.pop("embedding_size", None)
+    return {"row": public_row, "similarity": _similarity(stored, vector)}
+
+
+def _new_profile_evidence_strong(
+    quality: dict[str, Any],
+    original_face_pixels: int | None = None,
+) -> bool:
+    """Require stronger evidence for identity creation than for retrieval.
+
+    A weak or distant face may be retried against existing profiles, but it must
+    not silently create another person. Browser pixels are capped by server pixels
+    so padded crops cannot inflate the decision.
+    """
+    server_pixels = max(0, int(quality.get("face_pixels") or 0))
+    browser_pixels = max(0, int(original_face_pixels or 0))
+    observed_pixels = min(server_pixels, browser_pixels) if browser_pixels else server_pixels
+    overall = float(quality.get("overall") or 0.0)
+    return observed_pixels >= FACE_NEW_PROFILE_MIN_PIXELS and (
+        overall >= 48.0 or observed_pixels >= 128
+    )
+
+
+def _far_retrieval_evidence_eligible(
+    quality: dict[str, Any],
+    original_face_pixels: int | None,
+) -> bool:
+    """Allow a smaller face to retrieve known profiles without enrolling one."""
+    original_pixels = max(0, int(original_face_pixels or 0))
+    return (
+        original_pixels >= FACE_FAR_RETRIEVAL_MIN_PIXELS
+        and float(quality.get("overall") or 0.0) >= 35.0
+    )
+
+
+def _far_retrieval_requirement(original_face_pixels: int | None) -> tuple[int, float]:
+    """Return (real frames required, similarity threshold) for distant retrieval."""
+    pixels = max(0, int(original_face_pixels or 0))
+    if pixels < 48:
+        return 4, FACE_VERY_FAR_RETRIEVAL_THRESHOLD
+    return 3, FACE_FAR_RETRIEVAL_THRESHOLD
+
+
+def _reviewed_identity_keys(db: sqlite3.Connection, profile_id: str) -> set[str]:
+    """Return explicit human labels that can safely collapse duplicate candidates.
+
+    The margin gate is useful when the runner-up is a different unknown person. It
+    becomes counterproductive after the same reviewed person was accidentally saved
+    as two profiles: both gallery rows score highly, the margin approaches zero and
+    every later sighting becomes yet another duplicate. Only human-reviewed trusted
+    or confirmed-intruder labels participate in this equivalence check.
+    """
+    rows = db.execute(
+        """
+        SELECT status, display_label
+        FROM member_profile_labels
+        WHERE profile_id=?
+          AND status IN ('TRUSTED', 'CONFIRMED_INTRUDER')
+          AND display_label IS NOT NULL
+          AND TRIM(display_label)<>''
+        """,
+        (profile_id,),
+    ).fetchall()
+    return {
+        f"{row['status']}:{' '.join(str(row['display_label']).lower().split())}"
+        for row in rows
+    }
+
+
+def _same_reviewed_identity(
+    db: sqlite3.Connection,
+    first_profile_id: str,
+    second_profile_id: str,
+) -> bool:
+    if first_profile_id == second_profile_id:
+        return True
+    first = _reviewed_identity_keys(db, first_profile_id)
+    return bool(first and first.intersection(_reviewed_identity_keys(db, second_profile_id)))
+
+
+def _reviewed_intruder_label(db: sqlite3.Connection, profile_id: str) -> str | None:
+    row = db.execute(
+        """
+        SELECT display_label
+        FROM member_profile_labels
+        WHERE profile_id=? AND status='CONFIRMED_INTRUDER'
+          AND display_label IS NOT NULL AND TRIM(display_label)<>''
+        ORDER BY updated_at DESC LIMIT 1
+        """,
+        (profile_id,),
+    ).fetchone()
+    return " ".join(str(row["display_label"]).split()) if row else None
 
 
 def _face_evidence_quality(
@@ -1531,7 +1699,13 @@ def _face_evidence_quality(
         + lighting * 0.15
         + max(0.0, min(1.0, detector_confidence)) * 100.0 * 0.20
     )
-    eligible = face_pixels >= FACE_MIN_RECOGNITION_PIXELS and overall >= 48.0
+    # A large face must not remain stuck behind a soft lighting/sharpness score.
+    # Quality still appears in the response and gates escalation, but a >=96 px
+    # face is valid for anonymous retrieval even in ordinary indoor lighting.
+    large_face_override = face_pixels >= max(96, FACE_MIN_RECOGNITION_PIXELS)
+    eligible = face_pixels >= FACE_MIN_RECOGNITION_PIXELS and (
+        overall >= 42.0 or large_face_override
+    )
     if eligible:
         state = "RECOGNITION_ELIGIBLE"
         reason = "Face has sufficient pixels and quality for candidate retrieval."
@@ -1550,6 +1724,7 @@ def _face_evidence_quality(
         "lighting": round(lighting, 1),
         "resolution": round(resolution, 1),
         "overall": round(overall, 1),
+        "large_face_override": large_face_override,
     }
 
 
@@ -1580,6 +1755,16 @@ def _estimate_height_for_sighting(
     image_width: int,
     image_height: int,
 ) -> dict[str, Any]:
+    camera_row = db.execute(
+        "SELECT camera_trust FROM member_cameras WHERE camera_id=?", (camera_id,)
+    ).fetchone()
+    camera_trust = float(camera_row["camera_trust"] if camera_row else 50.0)
+    policy = evidence_policy_for_trust(camera_trust)
+    if not policy["height_enabled"]:
+        return {
+            "height_status": "Height disabled by camera trust policy",
+            "evidence_policy": policy,
+        }
     cal_row = db.execute(
         "SELECT * FROM member_camera_calibrations WHERE camera_id=?", (camera_id,)
     ).fetchone()
@@ -1592,19 +1777,32 @@ def _estimate_height_for_sighting(
     # Browser boxes are in the current frame dimensions. Scale to calibration size.
     sx = cal.image_width / max(image_width, 1)
     sy = cal.image_height / max(image_height, 1)
-    scaled = [
-        {
+    scaled = []
+    for box in person_boxes[-12:]:
+        item = {
             "x": float(box.get("x", 0)) * sx,
             "y": float(box.get("y", 0)) * sy,
             "width": float(box.get("width", 0)) * sx,
             "height": float(box.get("height", 0)) * sy,
+            "partial": bool(box.get("partial", False)),
         }
-        for box in person_boxes[-12:]
-    ]
+        if box.get("head_y") is not None:
+            item["head_y"] = float(box["head_y"]) * sy
+        if box.get("foot_y") is not None:
+            item["foot_y"] = float(box["foot_y"]) * sy
+        scaled.append(item)
     observations = observations_from_person_boxes(scaled, cal.image_height, cal.image_width)
     try:
         estimate = estimate_height(cal, observations)
-        return {**estimate.to_dict(), "height_status": "ESTIMATED"}
+        payload = estimate.to_dict()
+        partial = "partial-view" in estimate.method
+        return {
+            **payload,
+            "height_status": "APPROXIMATE_ESTIMATE" if partial else "ESTIMATED",
+            "approximate": partial,
+            "identity_input": False,
+            "evidence_policy": policy,
+        }
     except HeightUnavailable as exc:
         return {"height_status": str(exc)}
 
@@ -1654,10 +1852,13 @@ def _match_breakdown(
     overlap = _height_overlap(previous_height, current_height)
     components["height_overlap"] = None if overlap is None else round(overlap * 100, 1)
     if overlap is not None:
-        scores.append((overlap * 100, 0.10))
-        reasons.append("Height bands are compatible" if overlap >= 0.35 else "Height bands do not support the match")
+        reasons.append(
+            "Height bands are compatible (display-only corroboration; not scored)"
+            if overlap >= 0.35
+            else "Height differs (display-only; identity and escalation are unchanged)"
+        )
     else:
-        reasons.append("Height unavailable on one or both sightings")
+        reasons.append("Height unavailable on one or both sightings; identity is unaffected")
 
     known = 0
     agreed = 0
@@ -1953,6 +2154,10 @@ async def create_face_sighting(
     image_width: int | None = Form(None),
     image_height: int | None = Form(None),
     track_id: str | None = Form(None),
+    continuity_profile_id: str | None = Form(None),
+    original_face_pixels: int | None = Form(None),
+    observed_camera_trust: float | None = Form(None),
+    retrieval_only: bool = Form(False),
     samples_considered: int = Form(1),
     enable_height_fallback: bool = Form(False),
     appearance_json: str | None = Form(None),
@@ -1960,6 +2165,17 @@ async def create_face_sighting(
     started = time.perf_counter()
     user = _get_user(user_id)
     camera = _get_camera(camera_id, user_id)
+    stored_camera_trust = max(0.0, min(100.0, float(camera.get("camera_trust", 50))))
+    effective_camera_trust = stored_camera_trust
+    if observed_camera_trust is not None:
+        # A live observation may reduce a camera's usable trust for this frame,
+        # but client input can never raise the server-side camera reputation.
+        effective_camera_trust = min(
+            stored_camera_trust,
+            max(0.0, min(100.0, float(observed_camera_trust))),
+        )
+    camera = {**camera, "camera_trust": effective_camera_trust}
+    evidence_policy = evidence_policy_for_trust(effective_camera_trust)
     raw = await image.read()
     if not raw or len(raw) > MAX_FACE_UPLOAD:
         raise HTTPException(status_code=413, detail="camera frame is empty or too large")
@@ -1976,7 +2192,17 @@ async def create_face_sighting(
     else:
         vector, server_confidence, crop, face_box = prepared
     evidence_quality = _face_evidence_quality(crop, face_box, server_confidence)
-    if not evidence_quality["eligible"]:
+    far_required_samples, far_match_threshold = _far_retrieval_requirement(
+        original_face_pixels
+    )
+    far_retrieval_eligible = bool(
+        retrieval_only
+        and samples_considered >= far_required_samples
+        and _far_retrieval_evidence_eligible(
+            evidence_quality, original_face_pixels
+        )
+    )
+    if not evidence_quality["eligible"] and not far_retrieval_eligible:
         raise HTTPException(status_code=422, detail={
             "code": "FACE_EVIDENCE_INELIGIBLE",
             "quality": evidence_quality,
@@ -2010,19 +2236,94 @@ async def create_face_sighting(
         best, runner_up = _gallery_candidates(db, vector)
         runner_up_similarity = float(runner_up["similarity"]) if runner_up else 0.0
         match_margin = float(best["similarity"] - runner_up_similarity) if best else 1.0
+        duplicate_reviewed_identity = bool(
+            best
+            and runner_up
+            and _same_reviewed_identity(
+                db,
+                best["row"]["profile_id"],
+                runner_up["row"]["profile_id"],
+            )
+        )
+        match_threshold = (
+            far_match_threshold
+            if retrieval_only
+            else FACE_MATCH_THRESHOLD
+        )
         matched = bool(
             best
-            and best["similarity"] >= FACE_MATCH_THRESHOLD
-            and (runner_up is None or match_margin >= FACE_MATCH_MARGIN)
+            and best["similarity"] >= match_threshold
+            and (
+                runner_up is None
+                or match_margin >= FACE_MATCH_MARGIN
+                or duplicate_reviewed_identity
+            )
         )
+        matched_via_track_continuity = False
+        selected = best
+        continuity_candidate = _track_continuity_candidate(
+            db, continuity_profile_id, vector
+        )
+        if (
+            not matched
+            and not retrieval_only
+            and continuity_candidate
+            and continuity_candidate["similarity"] >= FACE_TRACK_CONTINUITY_THRESHOLD
+            and (
+                best is None
+                or continuity_candidate["similarity"] >= best["similarity"] - 0.08
+            )
+        ):
+            matched = True
+            matched_via_track_continuity = True
+            selected = continuity_candidate
+        if retrieval_only and not matched:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "FACE_FAR_RETRIEVAL_UNCERTAIN",
+                    "message": (
+                        "Distant face was searched against known people but was "
+                        "not strong enough to assert a match. Move closer."
+                    ),
+                    "candidate_similarity": round(
+                        float(best["similarity"]), 3
+                    ) if best else None,
+                    "required_similarity": match_threshold,
+                    "quality": evidence_quality,
+                },
+            )
+        if (
+            not matched
+            and best is not None
+            and (
+                best["similarity"] >= FACE_AMBIGUOUS_RETRY_THRESHOLD
+                or not _new_profile_evidence_strong(
+                    evidence_quality, original_face_pixels
+                )
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "FACE_MATCH_UNCERTAIN_RETRY",
+                    "message": (
+                        "Face found, but the comparison is not strong enough to "
+                        "create another person. Retrying the same face."
+                    ),
+                    "candidate_similarity": round(float(best["similarity"]), 3),
+                    "required_similarity": match_threshold,
+                    "quality": evidence_quality,
+                },
+            )
         if matched:
-            profile_id = best["row"]["profile_id"]
-            anonymous_label = best["row"]["anonymous_label"]
+            profile_id = selected["row"]["profile_id"]
+            anonymous_label = selected["row"]["anonymous_label"]
             previous = db.execute(
                 "SELECT * FROM face_sightings WHERE profile_id=? ORDER BY captured_at DESC LIMIT 1",
                 (profile_id,),
             ).fetchone()
-            similarity = float(best["similarity"])
+            similarity = float(selected["similarity"])
         else:
             profile_id = f"FACE-{uuid.uuid4().hex[:8].upper()}"
             sequence = int(db.execute("SELECT COUNT(*) AS n FROM face_profiles").fetchone()["n"]) + 1
@@ -2040,7 +2341,7 @@ async def create_face_sighting(
             if matched
             else "NEW_PROFILE"
         )
-        prior_system_status = str(best["row"]["system_status"] or "UNKNOWN") if matched and best else "UNKNOWN"
+        prior_system_status = str(selected["row"]["system_status"] or "UNKNOWN") if matched and selected else "UNKNOWN"
         # Never downgrade a human-confirmed intruder or an active incident merely
         # because another biometric sighting was captured. The old implementation
         # replaced these states with REPEAT_VISITOR on every match, which could
@@ -2105,6 +2406,9 @@ async def create_face_sighting(
                 "REVIEW_REQUIRED" if review_required else "UNREVIEWED",
             ),
         )
+        # Make the new sighting available as a retrieval template on the next
+        # frame while leaving the stable profile enrolment vector untouched.
+        invalidate_face_gallery()
         db.execute("UPDATE member_cameras SET last_seen_at=? WHERE camera_id=?", (captured_at, camera_id))
         _audit(
             db, "face_sightings", sighting_id, "INSERT", user_id,
@@ -2131,6 +2435,8 @@ async def create_face_sighting(
         if (
             not active
             and matched
+            and evidence_policy["biometric_escalation_enabled"]
+            and evidence_policy["alert_enabled"]
             and journey["plausible"]
             and breakdown["overall"] >= 72
             and profile_system_status in {"CONFIRMED_INTRUDER", "ACTIVE_INCIDENT"}
@@ -2151,7 +2457,14 @@ async def create_face_sighting(
                 if incident_watch:
                     active = {"incident_id": incident_watch["incident_id"]}
 
-        if active and matched and journey["plausible"] and breakdown["overall"] >= 72:
+        if (
+            active
+            and matched
+            and evidence_policy["biometric_escalation_enabled"]
+            and evidence_policy["alert_enabled"]
+            and journey["plausible"]
+            and breakdown["overall"] >= 72
+        ):
             incident_id = active["incident_id"]
             db.execute("UPDATE member_incidents SET updated_at=? WHERE incident_id=?", (captured_at, incident_id))
             notification_id = f"NOTE-{uuid.uuid4().hex[:10].upper()}"
@@ -2249,6 +2562,7 @@ async def create_face_sighting(
             "SELECT * FROM member_profile_labels WHERE profile_id=? AND user_id=?",
             (profile_id, user_id),
         ).fetchone()
+        reviewed_display_label = _reviewed_intruder_label(db, profile_id)
 
     security_dispatch = None
     if incident_watch:
@@ -2298,6 +2612,7 @@ async def create_face_sighting(
         "sighting": current_sighting,
         "profile_id": profile_id,
         "anonymous_label": anonymous_label,
+        "reviewed_display_label": reviewed_display_label,
         "classification": "REPEAT_VISITOR_CANDIDATE" if matched else "NEW_VISITOR",
         "profile_status": response_profile_status,
         "viewer_classification": dict(viewer_classification) if viewer_classification else {"status": "UNKNOWN"},
@@ -2305,11 +2620,17 @@ async def create_face_sighting(
         "similarity": round(similarity, 3),
         "runner_up_similarity": round(runner_up_similarity, 3),
         "match_margin": round(match_margin, 3),
-        "threshold": FACE_MATCH_THRESHOLD,
+        "duplicate_reviewed_identity": duplicate_reviewed_identity,
+        "matched_via_track_continuity": matched_via_track_continuity,
+        "retrieval_only": retrieval_only,
+        "far_retrieval_eligible": far_retrieval_eligible,
+        "far_required_samples": far_required_samples if retrieval_only else None,
+        "threshold": match_threshold,
         "margin_threshold": FACE_MATCH_MARGIN,
         "track_id": track_id,
         "samples_considered": max(1, int(samples_considered)),
         "evidence_quality": evidence_quality,
+        "evidence_policy": evidence_policy,
         "sighting_count": len(sightings),
         "seen_at_other_properties": other_users,
         "current_user": user["display_name"],
@@ -2325,6 +2646,8 @@ async def create_face_sighting(
             "face_similarity": round(similarity, 3),
             "runner_up_similarity": round(runner_up_similarity, 3),
             "candidate_margin": round(match_margin, 3),
+            "matched_via_live_track": matched_via_track_continuity,
+            "runner_up_same_reviewed_identity": duplicate_reviewed_identity,
             "appearance_agreement": breakdown["components"].get("appearance_agreement"),
             "journey_plausible": bool(journey["plausible"]),
             "journey_reason": breakdown["reasons"][-1],
@@ -2351,6 +2674,9 @@ async def create_face_sightings_batch(
     user_id: str = Form(...),
     camera_id: str = Form(...),
     candidates_json: str = Form(...),
+    person_boxes_json: str | None = Form(None),
+    image_width: int | None = Form(None),
+    image_height: int | None = Form(None),
 ):
     """Recognise all stable browser tracks through one network request.
 
@@ -2390,7 +2716,7 @@ async def create_face_sightings_batch(
     for track_id, entries in groups.items():
         try:
             observations: list[dict[str, Any]] = []
-            for index, candidate in entries[:3]:
+            for index, candidate in entries[:5]:
                 raw = image_bytes[index]
                 if not raw or len(raw) > MAX_FACE_UPLOAD:
                     continue
@@ -2399,7 +2725,13 @@ async def create_face_sightings_batch(
                     continue
                 vector, confidence, crop, face_box = _embedding_from_image(frame)
                 quality = _face_evidence_quality(crop, face_box, confidence)
-                if not quality["eligible"]:
+                retrieval_only = bool(candidate.get("retrieval_only"))
+                if not quality["eligible"] and not (
+                    retrieval_only
+                    and _far_retrieval_evidence_eligible(
+                        quality, int(candidate.get("face_pixels") or 0) or None
+                    )
+                ):
                     continue
                 browser_quality = max(0.0, min(100.0, float(candidate.get("quality") or 0.0)))
                 weight = max(0.05, quality["overall"] / 100.0) * max(
@@ -2429,6 +2761,20 @@ async def create_face_sightings_batch(
             best = max(observations, key=lambda item: item["weight"])
             weights = np.asarray([item["weight"] for item in observations], dtype=np.float32)
             matrix = np.vstack([item["vector"] for item in observations]).astype(np.float32)
+            retrieval_batch = bool(best["candidate"].get("retrieval_only"))
+            # Distant crops are noisy. Select the embedding with the strongest
+            # agreement to the other real frames, then exclude outliers before
+            # averaging. One blurred frame can no longer drag the signature away
+            # from a less frequently sighted intruder profile.
+            if retrieval_batch and len(observations) >= 4:
+                norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+                normalised = matrix / np.maximum(norms, 1e-9)
+                agreement = np.clip((normalised @ normalised.T + 1.0) / 2.0, 0.0, 1.0)
+                medoid_index = int(np.argmax(np.median(agreement, axis=1)))
+                inlier_mask = agreement[medoid_index] >= 0.70
+                if int(np.count_nonzero(inlier_mask)) >= max(3, (len(observations) + 1) // 2):
+                    matrix = matrix[inlier_mask]
+                    weights = weights[inlier_mask]
             aggregate = np.average(matrix, axis=0, weights=weights).astype(np.float32)
             norm = float(np.linalg.norm(aggregate))
             if norm <= 1e-12:
@@ -2465,11 +2811,21 @@ async def create_face_sightings_batch(
                     user_id=user_id,
                     camera_id=camera_id,
                     browser_confidence=float(candidate.get("confidence") or 0.0),
-                    person_boxes_json="[]",
+                    person_boxes_json=person_boxes_json or "[]",
                     target_face_box_json=None,
-                    image_width=int(candidate.get("crop_width") or 0) or None,
-                    image_height=int(candidate.get("crop_height") or 0) or None,
+                    image_width=image_width or int(candidate.get("crop_width") or 0) or None,
+                    image_height=image_height or int(candidate.get("crop_height") or 0) or None,
                     track_id=track_id,
+                    continuity_profile_id=str(
+                        candidate.get("continuity_profile_id") or ""
+                    ).strip() or None,
+                    original_face_pixels=int(candidate.get("face_pixels") or 0) or None,
+                    observed_camera_trust=(
+                        float(candidate["observed_camera_trust"])
+                        if candidate.get("observed_camera_trust") is not None
+                        else None
+                    ),
+                    retrieval_only=bool(candidate.get("retrieval_only")),
                     samples_considered=len(observations),
                     enable_height_fallback=False,
                     appearance_json=_safe_json(appearance) if appearance else None,
@@ -2477,7 +2833,11 @@ async def create_face_sightings_batch(
             finally:
                 _PREPARED_FACE_OBSERVATION.reset(token)
             result["browser_quality"] = round(float(best["browser_quality"]), 1)
-            result["signature_method"] = "QUALITY_WEIGHTED_MULTI_FRAME"
+            result["signature_method"] = (
+                "FAR_KNOWN_PROFILE_MULTI_FRAME"
+                if bool(candidate.get("retrieval_only"))
+                else "QUALITY_WEIGHTED_MULTI_FRAME"
+            )
             results.append(result)
         except HTTPException as exc:
             rejected.append({
@@ -2532,6 +2892,9 @@ def list_face_sightings(user_id: str, limit: int = Query(30, ge=1, le=200)):
             resolved_status = _profile_status(db, item["profile_id"], user_id)
             if resolved_status in {"ACTIVE_INCIDENT", "CONFIRMED_INTRUDER"}:
                 item["effective_status"] = resolved_status
+                reviewed_label = _reviewed_intruder_label(db, item["profile_id"])
+                if reviewed_label:
+                    item["effective_label"] = reviewed_label
             sightings.append(item)
     return {"user_id": user_id, "count": len(sightings), "sightings": sightings}
 
@@ -2614,6 +2977,9 @@ def classify_visitor(profile_id: str, body: ProfileClassificationIn):
             "UPDATE face_profiles SET system_status=?, review_required=?, last_classified_at=? WHERE profile_id=?",
             (profile_system, int(body.status == "REVIEW_REQUIRED"), now, profile_id),
         )
+        # Gallery vectors are unchanged, but cached operational status is part of
+        # each row and must reflect this human decision on the very next frame.
+        invalidate_face_gallery()
         _audit(
             db, "member_profile_labels", f"{profile_id}:{body.user_id}", "UPSERT", body.updated_by,
             f"{profile['anonymous_label']} marked {body.status.replace('_', ' ').lower()} at {user['household']}",
@@ -2801,6 +3167,81 @@ def get_member_calibration(camera_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="camera has no stored height calibration")
     return dict(row)
+
+
+@router.post("/api/member/sightings/{sighting_id}/height")
+def update_member_sighting_height(sighting_id: str, body: SightingHeightIn):
+    """Attach delayed full-body evidence without delaying face recognition.
+
+    Browser face results are returned immediately.  The independently scheduled
+    person detector can then contribute three or more full-body boxes to the same
+    persisted sighting, allowing calibrated height to appear a moment later.
+    """
+    _get_user(body.user_id)
+    _get_camera(body.camera_id, body.user_id)
+    initialise_member_store()
+    with connect() as db:
+        row = db.execute(
+            """
+            SELECT * FROM face_sightings
+            WHERE sighting_id=? AND user_id=? AND camera_id=?
+            """,
+            (sighting_id, body.user_id, body.camera_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="sighting not found for this camera")
+        height = _estimate_height_for_sighting(
+            db,
+            body.camera_id,
+            body.person_boxes,
+            body.image_width,
+            body.image_height,
+        )
+        primary_person = max(
+            body.person_boxes,
+            key=lambda item: float(item.get("width", 0)) * float(item.get("height", 0)),
+        )
+        db.execute(
+            """
+            UPDATE face_sightings SET
+                height_low_m=?, height_high_m=?, height_point_m=?, height_quality=?,
+                height_method=?, height_status=?, person_box_json=?
+            WHERE sighting_id=?
+            """,
+            (
+                height.get("height_low_m"), height.get("height_high_m"),
+                height.get("height_point_m"), height.get("quality"),
+                height.get("method"), height.get("height_status"),
+                _safe_json(primary_person), sighting_id,
+            ),
+        )
+        _audit(
+            db, "face_sightings", sighting_id, "HEIGHT_UPDATE", body.user_id,
+            "Delayed full-body frames attached to live sighting",
+            {"height": height, "frames_received": len(body.person_boxes)},
+        )
+        updated = db.execute(
+            """
+            SELECT s.*, p.anonymous_label, u.display_name,
+                   c.household, c.suburb, c.device_label,
+                   l.status AS viewer_status, l.display_label AS viewer_display_label
+            FROM face_sightings s
+            JOIN face_profiles p ON p.profile_id=s.profile_id
+            JOIN member_users u ON u.user_id=s.user_id
+            JOIN member_cameras c ON c.camera_id=s.camera_id
+            LEFT JOIN member_profile_labels l
+              ON l.profile_id=s.profile_id AND l.user_id=?
+            WHERE s.sighting_id=?
+            """,
+            (body.user_id, sighting_id),
+        ).fetchone()
+    return {
+        "updated": True,
+        "sighting_id": sighting_id,
+        "profile_id": row["profile_id"],
+        "height": height,
+        "sighting": _sighting_payload(updated) if updated else None,
+    }
 
 
 @router.post("/api/member/incidents/start")

@@ -8,25 +8,20 @@
 # precinct-level, so suburbs sharing a station share a score.
 
 import json
-from collections import defaultdict
 import numpy as np
-import openpyxl
+import pandas as pd
 import config
 
-LATEST_COL = 17  # 2015-2016 column in the Stations sheet
-
 def load_station_crime():
-    path = config.PARTNER_DIR / "saps_crime_by_type.xlsx"
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    ws = wb["Stations"]
-    rows = ws.iter_rows(values_only=True)
-    next(rows)  # header
+    path = config.PARTNER_DIR / "saps_2025_2026_by_station_crime.csv"
+    df = pd.read_csv(path)
+    df["Station"] = df["Station"].astype(str).str.upper().str.strip()
+    df["Incidents"] = pd.to_numeric(df["Incidents"], errors="raise").clip(lower=0)
     wanted = {c for cats in config.PERIL_TO_SAPS_CATEGORIES.values() for c in cats}
-    data = defaultdict(dict)
-    for r in rows:
-        station, crime, val = r[4], r[6], r[LATEST_COL]
-        if station and crime and str(crime) in wanted:
-            data[str(station).upper()][str(crime)] = val if isinstance(val, (int, float)) else 0
+    grouped = df[df["Crime_Category"].isin(wanted)].groupby(["Station", "Crime_Category"])["Incidents"].sum()
+    data = {}
+    for (station, crime), incidents in grouped.items():
+        data.setdefault(station, {})[crime] = int(incidents)
     return data
 
 def fuse_typed():
@@ -61,7 +56,7 @@ def fuse_typed():
             "matched_total": total,
             "saps_typed_score": s_score,
             "corroborated": bool(total >= med),
-            "year": "2015-2016",
+            "year": "2025/2026",
         }
         h["blended_risk_v2"] = blended_v2
         summary.append({"suburb": h["name"], "station": station, "peril": peril,

@@ -15,9 +15,10 @@ Both return a *band*, never a point estimate: detector boxes are noisy and a sin
 pixel of error at the top of frame is worth centimetres. The band widens honestly
 as geometry gets worse.
 
-The estimate is refused outright when the subject is clipped by the frame edge,
-when the camera's calibration has drifted, or when the geometry is degenerate.
-That refusal is the point: a wrong height is worse than no height.
+Full-view estimates are preferred.  When a tracked subject is vertically clipped,
+the caller may provide inferred head/foot rows from the face/body track.  Those
+observations require five frames and always return a visibly wider approximate
+band.  They remain corroborating metadata and are never an identity input.
 """
 from __future__ import annotations
 
@@ -37,6 +38,13 @@ MIN_SUBJECT_PIXELS = 60
 
 # Calibration confidence below which height is disabled entirely (Camera Trust).
 MIN_CALIBRATION_SCORE = 70
+
+# Partial-view estimates must be honest about their extra uncertainty.  A
+# 20-centimetre-wide band communicates roughly +/-10 cm without pretending that
+# an inferred head or foot row is as precise as a visible one.
+PARTIAL_MIN_HALF_BAND_M = 0.10
+PARTIAL_HEAD_PIXEL_SIGMA = 8.0
+PARTIAL_FOOT_PIXEL_SIGMA = 12.0
 
 
 class HeightUnavailable(Exception):
@@ -176,6 +184,7 @@ def estimate_single_frame(
     foot_y: float,
     head_y: float,
     frame_clipped: bool = False,
+    allow_partial: bool = False,
 ) -> tuple[float, float, float]:
     """Return (point, low, high) in metres for one frame.
 
@@ -184,7 +193,7 @@ def estimate_single_frame(
     means very different things near and far from the camera.
     """
     cal.validate()
-    if frame_clipped:
+    if frame_clipped and not allow_partial:
         raise HeightUnavailable("subject clipped by the frame edge — head or feet not fully visible")
     if foot_y <= head_y:
         raise HeightUnavailable("foot row is above head row — box is inverted or invalid")
@@ -197,8 +206,11 @@ def estimate_single_frame(
     point = solver(cal, foot_y, head_y)
 
     # Worst cases: head too high + feet too low (over-estimate), and the reverse.
-    tall = solver(cal, foot_y + FOOT_PIXEL_SIGMA, head_y - HEAD_PIXEL_SIGMA)
-    short = solver(cal, foot_y - FOOT_PIXEL_SIGMA, head_y + HEAD_PIXEL_SIGMA)
+    # Inferred rows receive much larger pixel uncertainty than visible boundaries.
+    head_sigma = PARTIAL_HEAD_PIXEL_SIGMA if allow_partial else HEAD_PIXEL_SIGMA
+    foot_sigma = PARTIAL_FOOT_PIXEL_SIGMA if allow_partial else FOOT_PIXEL_SIGMA
+    tall = solver(cal, foot_y + foot_sigma, head_y - head_sigma)
+    short = solver(cal, foot_y - foot_sigma, head_y + head_sigma)
     low, high = sorted((short, tall))
 
     if not (0.6 < point < 2.6):
@@ -219,33 +231,43 @@ def estimate_height(
     if the frames disagree with each other.
     """
     cal.validate()
-    points: list[float] = []
-    lows: list[float] = []
-    highs: list[float] = []
+    accepted: list[tuple[float, float, float, bool]] = []
     rejected = 0
     reasons: set[str] = set()
 
     for obs in observations:
         try:
+            partial = bool(obs.get("partial", False))
             p, lo, hi = estimate_single_frame(
                 cal,
                 foot_y=float(obs["foot_y"]),
                 head_y=float(obs["head_y"]),
                 frame_clipped=bool(obs.get("clipped", False)),
+                allow_partial=partial,
             )
         except HeightUnavailable as exc:
             rejected += 1
             reasons.add(str(exc))
             continue
-        points.append(p)
-        lows.append(lo)
-        highs.append(hi)
+        accepted.append((p, lo, hi, partial))
 
-    if len(points) < 3:
+    full = [item for item in accepted if not item[3]]
+    if len(full) >= 3:
+        chosen = full
+        used_partial = False
+    elif len(accepted) >= 5:
+        chosen = accepted
+        used_partial = any(item[3] for item in chosen)
+    else:
+        needed = 3 if full else 5
         raise HeightUnavailable(
-            f"only {len(points)} usable frame(s), need 3 — "
+            f"only {len(accepted)} usable frame(s), need {needed} — "
             + ("; ".join(sorted(reasons)) if reasons else "subject not tracked long enough")
         )
+
+    points = [item[0] for item in chosen]
+    lows = [item[1] for item in chosen]
+    highs = [item[2] for item in chosen]
 
     point = median(points)
     low = median(lows)
@@ -256,10 +278,16 @@ def estimate_height(
     low = min(low, point - spread / 2)
     high = max(high, point + spread / 2)
 
+    if used_partial:
+        low = min(low, point - PARTIAL_MIN_HALF_BAND_M)
+        high = max(high, point + PARTIAL_MIN_HALF_BAND_M)
+
     width = high - low
     quality = max(0.0, min(1.0, 1.0 - width / 0.40))
     if cal.calibration_score < 90:
         quality *= cal.calibration_score / 100.0
+    if used_partial:
+        quality = min(quality, 0.72)
 
     notes: list[str] = []
     if rejected:
@@ -268,13 +296,22 @@ def estimate_height(
         notes.append(f"frames disagree by {spread * 100:.0f} cm — band widened accordingly")
     if width > 0.30:
         notes.append("band exceeds 30 cm — treat as corroborating detail only, not identifying")
+    if used_partial:
+        notes.append(
+            "approximate partial-view result: one or more head/foot rows were inferred; "
+            "not used for identity or automatic escalation"
+        )
 
     return HeightEstimate(
         low_m=low,
         high_m=high,
         point_m=point,
-        frames_used=len(points),
-        method=f"{cal.mode.lower()}-single-view",
+        frames_used=len(chosen),
+        method=(
+            f"{cal.mode.lower()}-partial-view-approximation"
+            if used_partial
+            else f"{cal.mode.lower()}-full-view"
+        ),
         quality=quality,
         notes=notes,
     )
@@ -288,18 +325,30 @@ def observations_from_person_boxes(
 ) -> list[dict]:
     """Convert detector person boxes into height observations.
 
-    A box touching the top or bottom of the frame is marked clipped, because the
-    real head or feet are outside the image and any height from it is fiction.
+    Explicit ``head_y`` / ``foot_y`` values may be supplied by a tracked face/body
+    association.  If a vertical edge is clipped these are treated as partial-view
+    observations and receive the wider uncertainty policy in ``estimate_height``.
+    Horizontal clipping alone does not invalidate vertical camera geometry.
     """
     out = []
     for b in boxes:
         y, h = float(b["y"]), float(b["height"])
         x, w = float(b.get("x", 0)), float(b.get("width", 0))
-        clipped = (
-            y <= edge_margin
-            or (y + h) >= image_height - edge_margin
-            or x <= edge_margin
-            or (x + w) >= image_width - edge_margin
+        top_clipped = y <= edge_margin
+        bottom_clipped = (y + h) >= image_height - edge_margin
+        vertical_clipped = top_clipped or bottom_clipped
+        explicit_partial = bool(b.get("partial", False))
+        head_y = float(b.get("head_y", y))
+        foot_y = float(b.get("foot_y", y + h))
+        out.append(
+            {
+                "head_y": head_y,
+                "foot_y": foot_y,
+                "clipped": vertical_clipped,
+                "partial": explicit_partial or vertical_clipped,
+                "top_clipped": top_clipped,
+                "bottom_clipped": bottom_clipped,
+                "side_clipped": x <= edge_margin or (x + w) >= image_width - edge_margin,
+            }
         )
-        out.append({"head_y": y, "foot_y": y + h, "clipped": clipped})
     return out

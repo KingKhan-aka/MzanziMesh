@@ -10,6 +10,7 @@ from sentinel_ops.models import (
     PlateSignal,
     VehicleSignal,
 )
+from sentinel_ops.trust_policy import evidence_policy_for_trust
 
 
 def _confidence(*values: Any) -> float:
@@ -39,6 +40,11 @@ def camera_ai_to_operations(payload: dict[str, Any]) -> CameraEvent:
     descriptor = "|".join(part for part in descriptor_parts if part)
 
     make_model = vehicle.get("make_model")
+    trust_score = float(payload.get("camera_trust_score", 50))
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    policy = metadata.get("evidence_policy")
+    if not isinstance(policy, dict):
+        policy = evidence_policy_for_trust(trust_score)
     return CameraEvent(
         event_id=str(payload["event_id"]),
         camera_id=str(payload["camera_id"]),
@@ -70,6 +76,7 @@ def camera_ai_to_operations(payload: dict[str, Any]) -> CameraEvent:
             lower_colour=appearance.get("lower_colour"),
             descriptor_token=descriptor or None,
         ),
-        camera_trust_score=float(payload.get("camera_trust_score", 50)),
+        camera_trust_score=trust_score,
+        evidence_policy=policy,
         source="sentinel-camera-ai",
     )

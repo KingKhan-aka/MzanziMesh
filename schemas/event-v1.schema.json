@@ -257,6 +257,37 @@
           ],
           "default": null,
           "title": "Ocr Confidence"
+        },
+        "ocr_frame_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Ocr Frame Count",
+          "type": "integer"
+        },
+        "character_confidences": {
+          "items": {
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          },
+          "title": "Character Confidences",
+          "type": "array"
+        },
+        "ocr_alternatives": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Ocr Alternatives",
+          "type": "array"
+        },
+        "consensus_method": {
+          "anyOf": [
+            {"type": "string"},
+            {"type": "null"}
+          ],
+          "default": null,
+          "title": "Consensus Method"
         }
       },
       "title": "PlateEvidence",

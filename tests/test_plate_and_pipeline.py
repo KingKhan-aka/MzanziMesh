@@ -6,7 +6,7 @@ from sentinel_camera_ai.detectors.face import FaceSystem
 from sentinel_camera_ai.detectors.plate import PlateSystem
 from sentinel_camera_ai.matching import compare_events
 from sentinel_camera_ai.pipeline import CameraAIPipeline, Candidate, CandidateBucket
-from sentinel_camera_ai.detectors.plate import OCRResult
+from sentinel_camera_ai.detectors.plate import OCRResult, vote_ocr_results
 from sentinel_camera_ai.quality import TrustResult
 from sentinel_camera_ai.synthetic import generate_demo_media
 
@@ -140,3 +140,55 @@ def test_repeat_after_cooldown_starts_a_new_event_bucket(tmp_path):
     bucket = CandidateBucket(candidate(0))
     assert pipeline._matching_bucket([bucket], candidate(2)) is bucket
     assert pipeline._matching_bucket([bucket], candidate(5)) is None
+
+
+def test_multi_frame_ocr_votes_per_character_and_keeps_alternatives():
+    result = vote_ocr_results(
+        [
+            OCRResult("CAI123GP", 0.62, "fixture"),
+            OCRResult("CAJ123GP", 0.91, "fixture"),
+            OCRResult("CAJ12GP", 0.58, "fixture"),
+            OCRResult("CAJ123GP", 0.86, "fixture"),
+        ]
+    )
+    assert result.text == "CAJ123GP"
+    assert result.consensus is True
+    assert result.observations == 4
+    assert result.confidence >= 0.75
+    assert len(result.character_confidences) == len(result.text)
+    assert result.alternatives[0]["text"] == "CAJ123GP"
+
+
+def test_candidate_bucket_persists_multi_frame_ocr_consensus(tmp_path):
+    config = _test_config(tmp_path)
+    pipeline = CameraAIPipeline(config)
+    start = datetime.fromisoformat("2026-07-24T21:07:00+02:00")
+
+    def candidate(text: str, confidence: float, second: int) -> Candidate:
+        return Candidate(
+            frame=np.zeros((80, 160, 3), dtype=np.uint8),
+            frame_index=second,
+            timestamp=start.replace(second=start.second + second),
+            motion_score=0.2,
+            faces=[], objects=[], plates=[], primary_vehicle=None,
+            primary_person=None, plate_detection=None,
+            plate_ocr=OCRResult(text, confidence, "fixture"),
+            vehicle_colour="Blue", vehicle_colour_confidence=0.8,
+            upper_colour="Unknown", lower_colour="Unknown",
+            appearance_confidence=0.0, direction="right",
+            trust=TrustResult(
+                score=90,
+                metrics={
+                    "sharpness": 90, "lighting": 90, "detection": 90,
+                    "unobstructed": 90, "resolution": 90,
+                },
+                raw={}, reasons=[],
+            ),
+        )
+
+    bucket = CandidateBucket(candidate("CAI123GP", 0.60, 0))
+    bucket.add(candidate("CAJ123GP", 0.92, 1))
+    bucket.add(candidate("CAJ123GP", 0.88, 2))
+    assert bucket.best.plate_ocr.text == "CAJ123GP"
+    assert bucket.best.plate_ocr.consensus is True
+    assert bucket.best.plate_ocr.observations == 3

@@ -11,6 +11,20 @@ def test_cassoojee_snapshot_loads_and_routes():
     assert hotspots
     assert all(hotspot.metro == "Gauteng" for hotspot in hotspots)
     assert comparison.optimised.distance_km > 0
+    assert 0 <= comparison.optimised.peak_risk_coverage_percent <= 100
+    assert comparison.coverage_change_points == round(
+        comparison.optimised.coverage_percent - comparison.baseline.coverage_percent,
+        1,
+    )
+    assert comparison.peak_risk_coverage_change_points == round(
+        comparison.optimised.peak_risk_coverage_percent
+        - comparison.baseline.peak_risk_coverage_percent,
+        1,
+    )
+    assert comparison.peak_risk_retained == (
+        comparison.optimised.peak_risk_coverage_percent
+        >= comparison.baseline.peak_risk_coverage_percent
+    )
     assert metadata["source"] in {"cassoojee-live", "cassoojee-snapshot"}
 
 

@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from sentinel_ops.geo import haversine_km
 from sentinel_ops.models import Alert, AlertEvaluationRequest, Hotspot
+from sentinel_ops.trust_policy import evidence_policy_for_trust
 
 
 def _in_peak(event, hotspot: Hotspot) -> bool:
@@ -18,6 +19,7 @@ def _in_peak(event, hotspot: Hotspot) -> bool:
 
 def evaluate_alert(request: AlertEvaluationRequest) -> Alert:
     event = request.event
+    policy = evidence_policy_for_trust(event.camera_trust_score)
     candidates = []
     for hotspot in request.hotspots:
         distance = haversine_km(event.location, hotspot.location)
@@ -41,6 +43,7 @@ def evaluate_alert(request: AlertEvaluationRequest) -> Alert:
             status="NO_ALERT",
             evidence_score=evidence_score,
             reasons=["Event is outside all configured hotspot geofences"],
+            evidence_policy=policy,
         )
 
     distance, hotspot = min(candidates, key=lambda item: item[0])
@@ -51,11 +54,13 @@ def evaluate_alert(request: AlertEvaluationRequest) -> Alert:
         + 10 * int(peak)
         + 0.10 * event.camera_trust_score
     )
-    gate = event.camera_trust_score >= 55 and (
+    gate = policy["alert_enabled"] and event.camera_trust_score >= 50 and (
         evidence_score >= 45 or hotspot.risk_score >= 80
     )
 
-    if not gate:
+    if not policy["alert_enabled"]:
+        priority = "NONE"
+    elif not gate:
         priority = "LOW" if combined >= 45 else "NONE"
     elif combined >= 75:
         priority = "HIGH"
@@ -71,6 +76,12 @@ def evaluate_alert(request: AlertEvaluationRequest) -> Alert:
         f"Evidence score is {evidence_score:.1f}/100",
         f"Camera trust is {event.camera_trust_score:.1f}/100",
     ]
+    if not policy["alert_enabled"]:
+        reasons.append("Alert escalation blocked: trust is below 50; metadata retained only")
+    elif not policy["biometric_escalation_enabled"]:
+        reasons.append("Biometric cues are excluded from escalation at this trust level")
+    if not policy["height_enabled"]:
+        reasons.append("Height estimation disabled by the trust policy")
     return Alert(
         alert_id=f"ALT-{uuid4().hex[:8].upper()}",
         event_id=event.event_id,
@@ -79,4 +90,5 @@ def evaluate_alert(request: AlertEvaluationRequest) -> Alert:
         hotspot_id=hotspot.hotspot_id,
         evidence_score=round(evidence_score, 1),
         reasons=reasons,
+        evidence_policy=policy,
     )

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
 from sentinel_ops.main import app
 from sentinel_ops.member_mesh import initialise_member_store
-from sentinel_ops.storage import connect
+from sentinel_ops.models import CameraEvent
+from sentinel_ops.storage import connect, save_event
 
 
 def test_claim_case_flow(tmp_path, monkeypatch):
@@ -22,6 +23,60 @@ def test_claim_case_flow(tmp_path, monkeypatch):
         case_id = data["case"]["case_id"]
         assert len(data["validations"]) == 10
         assert data["database"]["counts"]["claim_cases"] == 1
+
+        timeline_response = client.get(
+            f"/api/fraud/cases/{case_id}/timeline",
+            params={"minutes_before": 120, "minutes_after": 90, "radius_km": 12},
+        )
+        assert timeline_response.status_code == 200
+        timeline = timeline_response.json()
+        assert timeline["claim"]["case_id"] == case_id
+        assert timeline["search"]["minutes_before"] == 120
+        assert timeline["search"]["minutes_after"] == 90
+        assert timeline["search"]["radius_km"] == 12
+        assert timeline["story"]["human_review_required"] is True
+        assert any(
+            step["step_type"] == "CLAIM_INCIDENT"
+            for step in timeline["story"]["steps"]
+        )
+        assert timeline["story"]["steps"] == sorted(
+            timeline["story"]["steps"], key=lambda step: step["timestamp"]
+        )
+        assert isinstance(timeline["nearby_cameras"], list)
+        assert isinstance(timeline["linked_evidence"], list)
+
+        # The supplied workbook stores naive incident times while newer camera
+        # rows include +02:00; legacy camera rows can have the opposite shape.
+        # Both combinations must be normalised instead of raising a 500.
+        incident_at = datetime.fromisoformat(timeline["claim"]["incident_time"])
+        aware_incident = (
+            incident_at
+            if incident_at.tzinfo is not None
+            else incident_at.replace(tzinfo=timezone(timedelta(hours=2)))
+        )
+        naive_incident = incident_at.replace(tzinfo=None)
+        for event_id, captured_at in (
+            ("EVT-AWARE-TIME", aware_incident),
+            ("EVT-LEGACY-NAIVE-TIME", naive_incident),
+        ):
+            save_event(CameraEvent.model_validate({
+                "event_id": event_id,
+                "camera_id": f"CAM-{event_id}",
+                "timestamp": captured_at,
+                "location": timeline["claim"]["location"],
+                "plate": {"text": "LEGACYGP", "confidence": 0.8},
+                "camera_trust_score": 80,
+                "source": "mixed-timezone-test",
+            }))
+        mixed_timestamp_response = client.get(
+            f"/api/fraud/cases/{case_id}/timeline",
+            params={"minutes_before": 120, "minutes_after": 90, "radius_km": 12},
+        )
+        assert mixed_timestamp_response.status_code == 200
+        mixed_timeline = mixed_timestamp_response.json()
+        assert {"EVT-AWARE-TIME", "EVT-LEGACY-NAIVE-TIME"}.issubset(
+            {item["event_id"] for item in mixed_timeline["items"]}
+        )
 
         updated = client.post(
             f"/api/fraud/cases/{case_id}/validations",
@@ -98,11 +153,17 @@ def test_latest_member_incident_becomes_claim(tmp_path, monkeypatch):
 def test_camera_inbox_auto_ingest_reconciles_two_real_vehicle_clips(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_DATABASE_PATH", str(tmp_path / "camera-inbox.db"))
     from sentinel_ops import claims_case as case_module
+    trace_calls = []
 
     def fake_trace(case_id, upload_id, item, source_path, captured_at):
+        trace_calls.append(upload_id)
         plate = item["policy_plate"]
         now = captured_at.isoformat()
         with connect() as db:
+            db.execute(
+                "DELETE FROM claim_plate_scan_frames WHERE case_id=? AND upload_id=?",
+                (case_id, upload_id),
+            )
             db.execute(
                 """
                 INSERT INTO claim_plate_scan_frames(
@@ -144,4 +205,68 @@ def test_camera_inbox_auto_ingest_reconciles_two_real_vehicle_clips(tmp_path, mo
         assert validation["status"] == "MISMATCH"
         assert "DV70FTGP" in validation["value"] and "FG47MSGP" in validation["value"]
         assert data["workspace"]["database"]["counts"]["claim_plate_scan_frames"] == 2
+        assert len(trace_calls) == 2
 
+        # Simulate the all-dot cache written by the previous build, which had no
+        # reliable OCR-engine status. It must be reprocessed automatically.
+        legacy = data["workspace"]["camera_uploads"][0]
+        legacy_payload = dict(legacy["payload"])
+        legacy_payload.pop("ocr_engine", None)
+        legacy_payload.pop("ocr_engine_available", None)
+        legacy_payload.pop("ocr_error", None)
+        with connect() as db:
+            db.execute(
+                "UPDATE claim_plate_scan_frames SET raw_ocr=NULL, normalized_ocr=NULL "
+                "WHERE case_id=? AND upload_id=?",
+                (case_id, legacy["upload_id"]),
+            )
+            db.execute(
+                "UPDATE claim_camera_uploads SET payload_json=? WHERE case_id=? AND upload_id=?",
+                (case_module._safe_json(legacy_payload), case_id, legacy["upload_id"]),
+            )
+        rerun = client.post(f"/api/fraud/cases/{case_id}/camera-inbox/auto-ingest")
+        assert rerun.status_code == 200
+        assert len(trace_calls) == 3
+
+
+def test_relaxed_ocr_keeps_real_demo_clips_readable():
+    import cv2
+    import difflib
+    import json
+    from pathlib import Path
+
+    from sentinel_ops.claims_case import _relaxed_plate_ocr
+
+    root = Path(__file__).resolve().parents[3]
+    fixture = json.loads(
+        (root / "services" / "operations" / "fixtures" / "claims_camera_inbox.json")
+        .read_text(encoding="utf-8")
+    )
+    reads = {}
+    for item in fixture["uploads"]:
+        point = item["plate_track"][len(item["plate_track"]) // 2]
+        capture = cv2.VideoCapture(str(root / item["relative_media_path"]))
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 25)
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        capture.set(cv2.CAP_PROP_POS_FRAMES, round(float(point["time"]) * fps))
+        ok, frame = capture.read()
+        capture.release()
+        assert ok
+        x = round(float(point["x"]) * width)
+        y = round(float(point["y"]) * height)
+        w = round(float(point["width"]) * width)
+        h = round(float(point["height"]) * height)
+        pad_x, pad_y = round(w * 0.08), round(h * 0.18)
+        crop = frame[
+            max(0, y - pad_y):min(height, y + h + pad_y),
+            max(0, x - pad_x):min(width, x + w + pad_x),
+        ]
+        reads[item["policy_plate"]] = _relaxed_plate_ocr(
+            crop, item["policy_plate"]
+        )[0]
+
+    dented = reads["DV70FTGP"] or ""
+    driveway = reads["FG47MSGP"] or ""
+    assert difflib.SequenceMatcher(a="DV70FTGP", b=dented).ratio() >= 0.75
+    assert len(driveway) >= 2

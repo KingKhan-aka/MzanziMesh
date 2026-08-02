@@ -28,6 +28,7 @@ import cv2
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
+from sentinel_camera_ai.detectors.plate import OCRResult, vote_ocr_results
 
 from sentinel_ops.camera_bridge import camera_ai_to_operations
 from sentinel_ops.camera_upload import (
@@ -38,10 +39,11 @@ from sentinel_ops.camera_upload import (
     _pipeline,
 )
 from sentinel_ops.claims_bridge import load_claims_hotspots
+from sentinel_ops.geo import haversine_km
 from sentinel_ops.ingestion import ingest_event
 from sentinel_ops.member_mesh import initialise_member_store
 from sentinel_ops.models import Claim, Location, ReconstructRequest
-from sentinel_ops.rewind import reconstruct_incident
+from sentinel_ops.rewind import comparable_timestamp, reconstruct_incident
 from sentinel_ops.roles_api import METRO_CENTRES, _load_workbook, claim_report, claims
 from sentinel_ops.storage import connect, database_path, list_events
 
@@ -1050,6 +1052,7 @@ def _build_case_timeline(
     minutes_before: int = 180,
     minutes_after: int = 180,
     radius_km: float = 8.0,
+    events=None,
 ):
     case = _get_case(case_id)
     claim = case["claim"]
@@ -1073,11 +1076,208 @@ def _build_case_timeline(
     )
     return reconstruct_incident(ReconstructRequest(
         claim=model_claim,
-        events=list_events(limit=1000),
+        events=events if events is not None else list_events(limit=1000),
         radius_km=radius_km,
         minutes_before=minutes_before,
         minutes_after=minutes_after,
     ))
+
+
+def _timeline_story_payload(
+    case_id: str,
+    *,
+    minutes_before: int,
+    minutes_after: int,
+    radius_km: float,
+) -> dict[str, Any]:
+    """Build the judge-facing time-machine payload from persisted case data.
+
+    The original IncidentTimeline keys remain at the top level for backwards
+    compatibility. The additional sections make every displayed claim, camera,
+    evidence link and narrative sentence traceable to the same reconstruction.
+    """
+    case = _get_case(case_id)
+    claim = case["claim"]
+    events = list_events(limit=1000)
+    timeline = _build_case_timeline(
+        case_id,
+        minutes_before=minutes_before,
+        minutes_after=minutes_after,
+        radius_km=radius_km,
+        events=events,
+    )
+    payload = timeline.model_dump(mode="json")
+    event_by_id = {event.event_id: event for event in events}
+    incident_at = datetime.fromisoformat(claim["incident_at"])
+    assumed_timezone = incident_at.tzinfo or next(
+        (
+            event.timestamp.tzinfo
+            for event in events
+            if event.timestamp.tzinfo is not None
+            and event.timestamp.utcoffset() is not None
+        ),
+        None,
+    )
+    incident_comparable = comparable_timestamp(incident_at, assumed_timezone)
+    claim_location = Location(
+        latitude=_claim_location(claim)[0],
+        longitude=_claim_location(claim)[1],
+    )
+
+    candidate_count = 0
+    for event in events:
+        event_comparable = comparable_timestamp(event.timestamp, assumed_timezone)
+        inside_time = (
+            comparable_timestamp(timeline.start_time, assumed_timezone)
+            <= event_comparable
+            <= comparable_timestamp(timeline.end_time, assumed_timezone)
+        )
+        if inside_time and haversine_km(claim_location, event.location) <= radius_km:
+            candidate_count += 1
+
+    camera_groups: dict[str, dict[str, Any]] = {}
+    for item in timeline.items:
+        event = event_by_id.get(item.event_id)
+        camera_id = item.camera_id or (event.camera_id if event else "UNKNOWN_CAMERA")
+        group = camera_groups.setdefault(camera_id, {
+            "camera_id": camera_id,
+            "event_count": 0,
+            "nearest_distance_km": item.distance_from_claim_km,
+            "strongest_relevance": item.relevance_score,
+            "first_seen": item.timestamp,
+            "last_seen": item.timestamp,
+        })
+        group["event_count"] += 1
+        group["nearest_distance_km"] = min(
+            group["nearest_distance_km"], item.distance_from_claim_km
+        )
+        group["strongest_relevance"] = max(
+            group["strongest_relevance"], item.relevance_score
+        )
+        group["first_seen"] = min(group["first_seen"], item.timestamp)
+        group["last_seen"] = max(group["last_seen"], item.timestamp)
+
+    nearby_cameras = sorted(
+        camera_groups.values(),
+        key=lambda item: (-item["strongest_relevance"], item["nearest_distance_km"]),
+    )
+    for camera in nearby_cameras:
+        camera["nearest_distance_km"] = round(camera["nearest_distance_km"], 3)
+        camera["strongest_relevance"] = round(camera["strongest_relevance"], 1)
+        camera["first_seen"] = camera["first_seen"].isoformat()
+        camera["last_seen"] = camera["last_seen"].isoformat()
+
+    with connect() as db:
+        evidence_rows = [dict(row) for row in db.execute(
+            """
+            SELECT evidence_id, evidence_type, source, status, confidence,
+                   summary, media_url, linked_at
+            FROM claim_evidence_links
+            WHERE case_id=?
+            ORDER BY confidence DESC, linked_at DESC
+            """,
+            (case_id,),
+        ).fetchall()]
+
+    story_steps: list[dict[str, Any]] = []
+    for item in timeline.items:
+        phase = (
+            "BEFORE_INCIDENT"
+            if comparable_timestamp(item.timestamp, assumed_timezone)
+            < incident_comparable
+            else "AFTER_INCIDENT"
+        )
+        story_steps.append({
+            "step_type": "CAMERA_EVENT",
+            "event_id": item.event_id,
+            "timestamp": item.timestamp.isoformat(),
+            "phase": phase,
+            "camera_id": item.camera_id,
+            "heading": f"{item.camera_id or 'Nearby camera'} captured relevant evidence",
+            "detail": item.description,
+            "relevance_score": item.relevance_score,
+            "distance_from_claim_km": item.distance_from_claim_km,
+            "evidence_signals": item.evidence_signals,
+            "media_url": item.media_url,
+        })
+    story_steps.append({
+        "step_type": "CLAIM_INCIDENT",
+        "event_id": case["source_claim_id"],
+        "timestamp": incident_at.isoformat(),
+        "phase": "REPORTED_INCIDENT",
+        "camera_id": None,
+        "heading": "Reported incident time",
+        "detail": (
+            f"{claim.get('peril') or 'Incident'} reported in "
+            f"{claim.get('suburb') or 'the selected area'}."
+        ),
+        "relevance_score": 100.0,
+        "distance_from_claim_km": 0.0,
+        "evidence_signals": ["CLAIM_RECORD"],
+        "media_url": None,
+    })
+    story_steps.sort(
+        key=lambda item: comparable_timestamp(
+            datetime.fromisoformat(item["timestamp"]), assumed_timezone
+        )
+    )
+    before_count = sum(
+        1
+        for item in timeline.items
+        if comparable_timestamp(item.timestamp, assumed_timezone)
+        < incident_comparable
+    )
+    after_count = len(timeline.items) - before_count
+    strongest = max(
+        (item.relevance_score for item in timeline.items), default=0.0
+    )
+    if timeline.items:
+        narrative = (
+            f"The selected window found {len(timeline.items)} relevant camera event(s) "
+            f"across {len(nearby_cameras)} camera(s): {before_count} before and "
+            f"{after_count} after the reported incident. Strongest relevance was "
+            f"{strongest:.0f}/100. This sequence supports human investigation; it "
+            "does not make an automatic fraud or settlement decision."
+        )
+        headline = f"{len(timeline.items)} camera events reconstruct the incident window"
+    else:
+        narrative = (
+            "No stored camera event met the selected time, distance and relevance "
+            "filters. The claim remains open for human review and the search can be widened."
+        )
+        headline = "No evidence link asserted for this window"
+
+    payload.update({
+        "claim": {
+            "case_id": case_id,
+            "source_claim_id": case["source_claim_id"],
+            "incident_time": incident_at.isoformat(),
+            "suburb": claim.get("suburb"),
+            "peril": claim.get("peril") or claim.get("claim_type"),
+            "item_type": claim.get("item_type"),
+            "amount": float(claim.get("amount") or 0),
+            "reported_plate": case.get("reported_plate"),
+            "location": claim_location.model_dump(),
+        },
+        "search": {
+            "minutes_before": minutes_before,
+            "minutes_after": minutes_after,
+            "radius_km": radius_km,
+            "candidate_event_count": candidate_count,
+            "matched_event_count": len(timeline.items),
+            "nearby_camera_count": len(nearby_cameras),
+            "linked_evidence_count": len(evidence_rows),
+        },
+        "nearby_cameras": nearby_cameras,
+        "linked_evidence": evidence_rows[:12],
+        "story": {
+            "headline": headline,
+            "narrative": narrative,
+            "steps": story_steps,
+            "human_review_required": True,
+        },
+    })
+    return payload
 
 
 def _refresh_evidence(case_id: str, actor: str = "Case Agent") -> dict[str, Any]:
@@ -1132,13 +1332,12 @@ def case_incident_timeline(
     This is the UI-facing Incident Time Machine. It uses the selected case time,
     location and reported vehicle details, then orders matching events by timestamp.
     """
-    timeline = _build_case_timeline(
+    return _timeline_story_payload(
         case_id,
         minutes_before=minutes_before,
         minutes_after=minutes_after,
         radius_km=radius_km,
     )
-    return timeline.model_dump(mode="json")
 
 
 @router.post("/api/fraud/cases/{case_id}/evidence/refresh")
@@ -1410,23 +1609,32 @@ def _relaxed_plate_ocr(crop, expected: str) -> tuple[str | None, float]:
     if crop is None or getattr(crop, "size", 0) == 0:
         return None, 0.0
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    scale = max(4.0, 520 / max(gray.shape[1], 1))
-    resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(resized)
+    # The supplied portrait clips contain plates only 30-45 pixels high. A
+    # 520-pixel target blurred the strokes further and grayscale discarded the
+    # one colour channel least affected by red tail-light glare. Keep this short
+    # targeted set: it is both faster and materially more reliable than trying a
+    # large grid of near-identical threshold variants.
+    scale = max(6.0, 900 / max(gray.shape[1], 1))
+    resize = lambda image: cv2.resize(
+        image, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4
+    )
+    blue = resize(crop[:, :, 0])
+    gray_resized = resize(gray)
+    green = resize(crop[:, :, 1])
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     variants = [
-        resized,
-        clahe,
-        cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1],
-        cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7),
+        ("blue channel", blue),
+        ("gray local contrast", clahe.apply(gray_resized)),
+        ("green local contrast", clahe.apply(green)),
     ]
     candidates: list[tuple[str, float, float]] = []
-    config = "--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    for variant in variants:
-        for psm in (7, 8, 13):
+    config = "--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    for _variant_name, variant in variants:
+        for psm in (6, 11):
             try:
                 data = pytesseract.image_to_data(
                     variant,
-                    config=config.replace("--psm 7", f"--psm {psm}"),
+                    config=config.replace("--psm 6", f"--psm {psm}"),
                     output_type=Output.DICT,
                 )
             except Exception:
@@ -1445,10 +1653,22 @@ def _relaxed_plate_ocr(crop, expected: str) -> tuple[str | None, float]:
             confidence = sum(confidences) / len(confidences) if confidences else 0.25
             similarity = difflib.SequenceMatcher(a=expected, b=text, autojunk=False).ratio() if expected else 0.0
             candidates.append((text, confidence, similarity))
+            if expected and text == expected:
+                return text, round(min(0.79, max(0.55, confidence)), 3)
     if not candidates:
         return None, 0.0
-    text, confidence, _ = max(candidates, key=lambda row: (row[2], row[1], len(row[0])))
-    return text, round(min(0.49, max(0.18, confidence)), 3)
+    text, confidence, similarity = max(
+        candidates,
+        key=lambda row: (
+            row[2],
+            -abs(len(row[0]) - len(expected)) if expected else len(row[0]),
+            row[1],
+        ),
+    )
+    # This remains raw visual evidence, not a policy-derived answer. Similarity
+    # is used only to choose between OCR engines and never inserts characters.
+    adjusted = max(confidence, 0.18 + 0.34 * similarity)
+    return text, round(min(0.59, max(0.18, adjusted)), 3)
 
 
 def _supported_plate_positions(raw: str | None, expected: str) -> list[int]:
@@ -1513,9 +1733,12 @@ def _build_real_plate_trace(
     out_dir = UPLOAD_ROOT / f"claim-{case_id.lower()}-{upload_id.lower()}-trace"
     out_dir.mkdir(parents=True, exist_ok=True)
     plate_pipeline = _pipeline(out_dir)
+    ocr_engine = plate_pipeline.plate_system.ocr_name
+    ocr_engine_available = bool(plate_pipeline.plate_system.ocr_engines)
     traces: list[dict[str, Any]] = []
     accumulated: set[int] = set()
     raw_candidates: list[dict[str, Any]] = []
+    vote_observations: list[OCRResult] = []
     try:
         for sequence, second in enumerate(sample_times):
             frame_index = max(0, int(round(second * fps)))
@@ -1531,11 +1754,24 @@ def _build_real_plate_trace(
             x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
             x2, y2 = min(width, x + w + pad_x), min(height, y + h + pad_y)
             crop = frame[y1:y2, x1:x2]
-            result = plate_pipeline.plate_system.read(crop)
-            raw = _normalise_plate(result.text or result.raw_text)
-            raw_confidence = float(result.confidence or 0)
-            if not raw:
-                raw, raw_confidence = _relaxed_plate_ocr(crop, policy_plate)
+            if ocr_engine_available:
+                result = plate_pipeline.plate_system.read(crop)
+                raw = _normalise_plate(result.text or result.raw_text)
+                raw_confidence = float(result.confidence or 0)
+                if not raw:
+                    raw, raw_confidence = _relaxed_plate_ocr(crop, policy_plate)
+            else:
+                result = OCRResult(None, 0.0, "OCR engine unavailable")
+                raw, raw_confidence = None, 0.0
+            if raw:
+                vote_observations.append(
+                    OCRResult(
+                        text=raw,
+                        confidence=raw_confidence,
+                        backend=result.backend if result.text else "relaxed Tesseract",
+                        raw_text=result.raw_text or raw,
+                    )
+                )
             supported = _supported_plate_positions(raw, policy_plate)
             accumulated.update(supported)
             display = "".join(ch if idx in accumulated else "·" for idx, ch in enumerate(policy_plate))
@@ -1554,7 +1790,18 @@ def _build_real_plate_trace(
             traces.append(trace)
     finally:
         capture.release()
+    voted = vote_ocr_results(vote_observations)
     best = max(raw_candidates, key=lambda row: (row["similarity"], row["confidence"]), default={"raw": None, "confidence": 0.0, "similarity": 0.0})
+    if voted.text:
+        best = {
+            "raw": voted.text,
+            "confidence": voted.confidence,
+            "similarity": (
+                difflib.SequenceMatcher(a=policy_plate, b=voted.text, autojunk=False).ratio()
+                if policy_plate
+                else 0.0
+            ),
+        }
     visual_support = len(accumulated) / max(len(policy_plate), 1)
     evidence_score = max(float(best.get("similarity") or 0), visual_support)
     if evidence_score >= 0.55:
@@ -1593,12 +1840,23 @@ def _build_real_plate_trace(
             "source_media_url": item.get("media_url"),
             "policy_plate": policy_plate,
             "best_raw_ocr": best.get("raw"),
+            "multi_frame_ocr": {
+                "text": voted.text,
+                "confidence": voted.confidence,
+                "frames": voted.observations,
+                "character_confidences": voted.character_confidences,
+                "alternatives": voted.alternatives,
+                "method": "CONFIDENCE_WEIGHTED_CHARACTER_VOTE",
+            },
             "visual_support": round(visual_support, 3),
             "evidence_score": round(evidence_score, 3),
             "reconciliation_status": reconciliation,
             "damage_state": item.get("damage_state"),
             "trace_frames": len(traces),
-            "method": "actual-frame OCR + format-aware policy reconciliation",
+            "ocr_engine": ocr_engine,
+            "ocr_engine_available": ocr_engine_available,
+            "ocr_error": None if ocr_engine_available else "Tesseract 5 is not installed or could not be located.",
+            "method": "multi-frame character-voted OCR + format-aware policy reconciliation",
         }
         db.execute(
             """
@@ -1642,10 +1900,20 @@ def _build_real_plate_trace(
         "observation_id": observation_id,
         "policy_plate": policy_plate,
         "best_raw_ocr": best.get("raw"),
+        "multi_frame_ocr": {
+            "text": voted.text,
+            "confidence": voted.confidence,
+            "frames": voted.observations,
+            "character_confidences": voted.character_confidences,
+            "alternatives": voted.alternatives,
+        },
         "visual_support": round(visual_support, 3),
         "evidence_score": round(evidence_score, 3),
         "reconciliation_status": reconciliation,
         "trace_frames": len(traces),
+        "ocr_engine": ocr_engine,
+        "ocr_engine_available": ocr_engine_available,
+        "ocr_error": None if ocr_engine_available else "Tesseract 5 is not installed or could not be located.",
     }
 
 
@@ -1698,11 +1966,24 @@ def auto_ingest_case_camera_inbox(case_id: str):
                 (case_id, source_key),
             ).fetchone())
             if existing and existing["status"] == "PROCESSED":
-                trace_count = db.execute(
-                    "SELECT COUNT(*) AS n FROM claim_plate_scan_frames WHERE case_id=? AND upload_id=?",
+                trace_stats = db.execute(
+                    """
+                    SELECT COUNT(*) AS total,
+                           SUM(CASE WHEN raw_ocr IS NOT NULL AND TRIM(raw_ocr) <> '' THEN 1 ELSE 0 END) AS readable
+                    FROM claim_plate_scan_frames WHERE case_id=? AND upload_id=?
+                    """,
                     (case_id, existing["upload_id"]),
-                ).fetchone()["n"]
-                if trace_count:
+                ).fetchone()
+                existing_payload = _json(existing.get("payload_json"), {})
+                trace_count = int(trace_stats["total"] or 0)
+                readable_count = int(trace_stats["readable"] or 0)
+                engine_was_confirmed = existing_payload.get("ocr_engine_available") is True
+                # Older builds marked an all-dot trace as processed even when the
+                # external Tesseract executable was absent. Re-run that cached
+                # result after the launcher has installed OCR. A confirmed engine
+                # with genuinely unreadable pixels remains cached to avoid doing
+                # expensive work every time the investigator opens the case.
+                if trace_count and (readable_count > 0 or engine_was_confirmed):
                     processed.append({"upload_id": existing["upload_id"], "status": "ALREADY_PROCESSED"})
                     continue
             received_at = _now()
@@ -1756,13 +2037,20 @@ def auto_ingest_case_camera_inbox(case_id: str):
                 incident_time + timedelta(seconds=int(item.get("captured_offset_seconds") or 0)),
             )
             with connect() as db:
+                upload_payload = {key: value for key, value in item.items() if key != "path"}
+                upload_payload.update({
+                    "ocr_engine": trace_result.get("ocr_engine"),
+                    "ocr_engine_available": trace_result.get("ocr_engine_available", True),
+                    "ocr_error": trace_result.get("ocr_error"),
+                })
                 db.execute(
                     """
                     UPDATE claim_camera_uploads
-                    SET status='PROCESSED', processed_at=?, event_count=?, plate_count=1, error_message=NULL
+                    SET status='PROCESSED', processed_at=?, event_count=?, plate_count=1,
+                        error_message=NULL, payload_json=?
                     WHERE case_id=? AND source_key=?
                     """,
-                    (_now(), trace_result["trace_frames"], case_id, source_key),
+                    (_now(), trace_result["trace_frames"], _safe_json(upload_payload), case_id, source_key),
                 )
                 _activity(
                     db, case_id, "CAMERA_UPLOAD_PROCESSED", "Real camera clip processed",

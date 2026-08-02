@@ -46,6 +46,10 @@ class PlateEvidence(StrictModel):
     crop_url: str | None = None
     detection_confidence: float | None = Field(default=None, ge=0, le=1)
     ocr_confidence: float | None = Field(default=None, ge=0, le=1)
+    ocr_frame_count: int = Field(default=0, ge=0)
+    character_confidences: list[float] = Field(default_factory=list)
+    ocr_alternatives: list[dict[str, Any]] = Field(default_factory=list)
+    consensus_method: str | None = None
 
 
 class VehicleEvidence(StrictModel):
@@ -117,4 +121,3 @@ class ComparisonResult(StrictModel):
     possible_same_face: MatchDecision
     possible_same_appearance: MatchDecision
     warnings: list[str] = Field(default_factory=list)
-
