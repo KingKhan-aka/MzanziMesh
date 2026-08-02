@@ -46,6 +46,7 @@ WHATSAPP_RECIPIENT = "".join(ch for ch in os.getenv("WHATSAPP_DEMO_RECIPIENT", "
 WHATSAPP_TEMPLATE_NAME = os.getenv("WHATSAPP_CLOUD_TEMPLATE_NAME", "mzansimesh_security_dispatch_v1").strip()
 WHATSAPP_TEMPLATE_LANGUAGE = os.getenv("WHATSAPP_CLOUD_TEMPLATE_LANGUAGE", "en_US").strip()
 WHATSAPP_GRAPH_VERSION = os.getenv("WHATSAPP_GRAPH_VERSION", "v23.0").strip()
+WHATSAPP_MESSAGE_TEXT = os.getenv("WHATSAPP_CLOUD_MESSAGE_TEXT", "").strip()
 
 # The street names are real Benoni/Lakefield roads, while the points and movement are
 # deliberately approximate for the demo.  Production routing would use a road graph
@@ -158,8 +159,9 @@ def _whatsapp_configuration() -> dict[str, Any]:
         "WHATSAPP_CLOUD_PHONE_NUMBER_ID": WHATSAPP_PHONE_NUMBER_ID,
         "WHATSAPP_CLOUD_ACCESS_TOKEN": WHATSAPP_ACCESS_TOKEN,
         "WHATSAPP_DEMO_RECIPIENT": WHATSAPP_RECIPIENT,
-        "WHATSAPP_CLOUD_TEMPLATE_NAME": WHATSAPP_TEMPLATE_NAME,
     }
+    if not WHATSAPP_MESSAGE_TEXT:
+        required["WHATSAPP_CLOUD_TEMPLATE_NAME"] = WHATSAPP_TEMPLATE_NAME
     missing = [name for name, value in required.items() if not value]
     return {
         "configured": not missing,
@@ -167,6 +169,8 @@ def _whatsapp_configuration() -> dict[str, Any]:
         "sender": "MzansiMesh Security",
         "recipient": f"+{WHATSAPP_RECIPIENT}" if WHATSAPP_RECIPIENT else None,
         "template": WHATSAPP_TEMPLATE_NAME or None,
+        "message_text": WHATSAPP_MESSAGE_TEXT or None,
+        "message_type": "text" if WHATSAPP_MESSAGE_TEXT else "template",
         "language": WHATSAPP_TEMPLATE_LANGUAGE,
         "graph_version": WHATSAPP_GRAPH_VERSION,
         "missing": missing,
@@ -190,22 +194,27 @@ def _send_whatsapp_template(notification: dict[str, Any], dispatch: dict[str, An
         f"{float(dispatch.get('eta_minutes') or 0):.1f}",
         str(dispatch.get("dispatch_id") or notification.get("dispatch_id") or "pending"),
     ]
-    template_payload: dict[str, Any] = {
-        "name": WHATSAPP_TEMPLATE_NAME,
-        "language": {"code": WHATSAPP_TEMPLATE_LANGUAGE},
-    }
-    if WHATSAPP_TEMPLATE_NAME != "hello_world":
-        template_payload["components"] = [{
-            "type": "body",
-            "parameters": [{"type": "text", "text": value} for value in parameters],
-        }]
-    payload = {
+    payload: dict[str, Any] = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
         "to": WHATSAPP_RECIPIENT,
-        "type": "template",
-        "template": template_payload,
     }
+    if WHATSAPP_MESSAGE_TEXT:
+        payload.update({
+            "type": "text",
+            "text": {"preview_url": False, "body": WHATSAPP_MESSAGE_TEXT},
+        })
+    else:
+        template_payload: dict[str, Any] = {
+            "name": WHATSAPP_TEMPLATE_NAME,
+            "language": {"code": WHATSAPP_TEMPLATE_LANGUAGE},
+        }
+        if WHATSAPP_TEMPLATE_NAME != "hello_world":
+            template_payload["components"] = [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": value} for value in parameters],
+            }]
+        payload.update({"type": "template", "template": template_payload})
     request = Request(
         f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages",
         data=json.dumps(payload).encode("utf-8"),
@@ -231,7 +240,8 @@ def _send_whatsapp_template(notification: dict[str, Any], dispatch: dict[str, An
         "provider": "Meta WhatsApp Cloud API",
         "message_id": message_id,
         "recipient": f"+{WHATSAPP_RECIPIENT}",
-        "template": WHATSAPP_TEMPLATE_NAME,
+        "template": WHATSAPP_TEMPLATE_NAME if not WHATSAPP_MESSAGE_TEXT else None,
+        "message_type": payload["type"],
         "accepted": bool(message_id),
         "raw": result,
     }
