@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0",
+  "description": "Synthetic, consented demonstration camera uploads. They simulate clips already received from participating member cameras and are processed automatically when a claims case is opened.",
+  "uploads": [
+    {
+      "source_key": "SHER17-DOORBELL-001",
+      "display_name": "17 Sher Avenue · Doorbell camera",
+      "camera_id": "CAM-SHER17-DOORBELL",
+      "household": "17 Sher Avenue",
+      "suburb": "Lakefield",
+      "latitude": -26.198020,
+      "longitude": 28.310300,
+      "relative_media_path": "media/claims_camera_inbox/17_sher_doorbell.mp4",
+      "media_url": "/api/fraud/demo-camera-media/17_sher_doorbell.mp4",
+      "captured_offset_seconds": 0
+    },
+    {
+      "source_key": "SHER18-DRIVEWAY-001",
+      "display_name": "18 Sher Avenue · Driveway camera",
+      "camera_id": "CAM-SHER18-DRIVEWAY",
+      "household": "18 Sher Avenue",
+      "suburb": "Lakefield",
+      "latitude": -26.198090,
+      "longitude": 28.310420,
+      "relative_media_path": "media/claims_camera_inbox/18_sher_driveway.mp4",
+      "media_url": "/api/fraud/demo-camera-media/18_sher_driveway.mp4",
+      "captured_offset_seconds": 95
+    }
+  ]
+}
