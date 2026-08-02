@@ -4,6 +4,7 @@
   "uploads": [
     {
       "source_key": "REAL-DENT-DV70FTGP-001",
+      "source_claim_ids": ["INC-002"],
       "display_name": "Dented vehicle evidence · front camera",
       "camera_id": "CLIENT-CAM-DENT-01",
       "household": "Client-uploaded vehicle evidence",
@@ -24,6 +25,7 @@
     },
     {
       "source_key": "REAL-NORMAL-FG47MSGP-001",
+      "source_claim_ids": ["INC-003"],
       "display_name": "Normal vehicle evidence · driveway camera",
       "camera_id": "CLIENT-CAM-NORMAL-01",
       "household": "Client-uploaded vehicle evidence",

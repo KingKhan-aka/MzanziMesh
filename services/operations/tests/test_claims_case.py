@@ -9,6 +9,25 @@ from sentinel_ops.member_mesh import initialise_member_store
 from sentinel_ops.storage import connect
 
 
+def test_demo_claim_intake_metadata_is_deterministic_and_varied():
+    from sentinel_ops.claims_case import _enrich_demo_claim
+
+    rows = [
+        _enrich_demo_claim({
+            "incident_id": f"INC-{index:03d}",
+            "peril": "Theft",
+            "suburb": "BOKSBURG",
+            "item_type": "Vehicle",
+            "incident_at": "2026-06-27T12:07:00",
+        })
+        for index in range(1, 31)
+    ]
+    police_states = {row["police_reference_status"] for row in rows}
+    assert {"VERIFIED", "MISSING", "MALFORMED", "MISMATCH"} <= police_states
+    assert _enrich_demo_claim(rows[1]) == rows[1]
+    assert rows[1]["reported_plate"] == "DV70FTGP"
+
+
 def test_claim_case_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_DATABASE_PATH", str(tmp_path / "claims-case.db"))
     with TestClient(app) as client:
@@ -40,11 +59,20 @@ def test_claim_case_flow(tmp_path, monkeypatch):
         assert agent.status_code == 200
         assert agent.json()["agent"]["status"] == "COMPLETED"
         assert agent.json()["tasks"]
+        automated = {item["check_code"]: item for item in agent.json()["validations"]}
+        assert automated["INCIDENT_TIME"]["status"] == "VERIFIED"
+        assert automated["INCIDENT_DESCRIPTION"]["status"] == "VERIFIED"
 
         report = client.post(f"/api/fraud/cases/{case_id}/report/generate")
         assert report.status_code == 200
         assert report.json()["report"]["case_id"] == case_id
         assert report.json()["workspace"]["database"]["counts"]["claim_case_reports"] == 1
+
+        refreshed_queue = client.get(f"/api/fraud/cases/queue?q={source}&limit=2").json()["claims"]
+        queue_case = next(item for item in refreshed_queue if item["incident_id"] == source)
+        assert queue_case["ai_status"] == "COMPLETED"
+        assert queue_case["checks_complete"] >= 2
+        assert queue_case["report_ready"] is True
 
 
 def test_latest_member_incident_becomes_claim(tmp_path, monkeypatch):
@@ -95,7 +123,7 @@ def test_latest_member_incident_becomes_claim(tmp_path, monkeypatch):
         assert any(e["evidence_type"] == "MEMBER_INCIDENT" for e in data["evidence"])
 
 
-def test_camera_inbox_auto_ingest_reconciles_two_real_vehicle_clips(tmp_path, monkeypatch):
+def test_camera_inbox_auto_ingest_scopes_real_vehicle_clip_to_matching_claim(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_DATABASE_PATH", str(tmp_path / "camera-inbox.db"))
     from sentinel_ops import claims_case as case_module
 
@@ -130,18 +158,18 @@ def test_camera_inbox_auto_ingest_reconciles_two_real_vehicle_clips(tmp_path, mo
     monkeypatch.setattr(case_module, "_build_real_plate_trace", fake_trace)
 
     with TestClient(app) as client:
-        source = client.get("/api/fraud/cases/queue?limit=1").json()["claims"][0]["incident_id"]
+        queue_claim = client.get("/api/fraud/cases/queue?q=INC-002&limit=1").json()["claims"][0]
+        assert queue_claim["police_case_number"].startswith("CAS ")
+        assert queue_claim["reported_plate"] == "DV70FTGP"
+        source = queue_claim["incident_id"]
         case_id = client.post(f"/api/fraud/cases/open/{source}").json()["case"]["case_id"]
         response = client.post(f"/api/fraud/cases/{case_id}/camera-inbox/auto-ingest")
         assert response.status_code == 200
         data = response.json()
-        assert len(data["workspace"]["camera_uploads"]) == 2
+        assert len(data["workspace"]["camera_uploads"]) == 1
         assert all(item["status"] == "PROCESSED" for item in data["workspace"]["camera_uploads"])
-        assert data["continuity"]["status"] == "VEHICLE_MISMATCH"
-        assert set(data["continuity"]["distinct_vehicles"]) == {"DV70FTGP", "FG47MSGP"}
-        assert {item["normalized_plate"] for item in data["workspace"]["plates"]} == {"DV70FTGP", "FG47MSGP"}
-        validation = next(item for item in data["workspace"]["validations"] if item["check_code"] == "PLATE_MATCH")
-        assert validation["status"] == "MISMATCH"
-        assert "DV70FTGP" in validation["value"] and "FG47MSGP" in validation["value"]
-        assert data["workspace"]["database"]["counts"]["claim_plate_scan_frames"] == 2
+        assert data["continuity"]["status"] == "SINGLE_VEHICLE"
+        assert data["continuity"]["distinct_vehicles"] == ["DV70FTGP"]
+        assert {item["normalized_plate"] for item in data["workspace"]["plates"]} == {"DV70FTGP"}
+        assert data["workspace"]["database"]["counts"]["claim_plate_scan_frames"] == 1
 

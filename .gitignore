@@ -95,6 +95,7 @@ screenshots/
 
 # Keep source media if needed
 !media/
+!media/claims_camera_inbox/dented_vehicle_DV70FTGP.mp4
 
 # =========================
 # Machine Learning models

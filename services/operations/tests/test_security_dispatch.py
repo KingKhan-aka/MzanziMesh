@@ -68,19 +68,28 @@ def test_member_incident_creates_dispatch_notifications_and_movement(tmp_path: P
     assert dispatch["selected_unit_id"]
     assert len(dispatch["backup_unit_ids"]) == 2
     assert len(dispatch["notifications"]) == 3
-    assert dispatch["address"].startswith("10 Ness Avenue")
+    assert dispatch["address"].startswith("10 Killarney Avenue")
     assert "claim" not in dispatch
 
     state_before = client.get("/api/security/operations").json()
     selected = next(u for u in state_before["units"] if u["unit_id"] == dispatch["selected_unit_id"])
     before = (selected["latitude"], selected["longitude"])
+    priority_before = client.get("/api/notifications/priority?scope=security").json()
+    assert priority_before["count"] == 1
 
     acknowledged = client.post(
         f"/api/security/dispatches/{dispatch['dispatch_id']}/acknowledge",
         json={"acknowledged_by": "Test control room"},
     )
     assert acknowledged.status_code == 200
-    assert acknowledged.json()["status"] == "ACKNOWLEDGED"
+    acknowledged_payload = acknowledged.json()
+    assert acknowledged_payload["status"] == "ACKNOWLEDGED"
+    assert acknowledged_payload["route_update"]["recalculated_on_acknowledgement"] is True
+    assert acknowledged_payload["route_update"]["route_kind"] == "INCIDENT_RESPONSE"
+    assert acknowledged_payload["route"][0]["kind"] == "UNIT_START"
+    assert any(point["kind"] == "INCIDENT" for point in acknowledged_payload["route"])
+    priority_after = client.get("/api/notifications/priority?scope=security").json()
+    assert priority_after["count"] == 0
 
     tick = client.post("/api/security/simulation/tick", json={"steps": 1})
     assert tick.status_code == 200
@@ -105,3 +114,19 @@ def test_member_incident_creates_dispatch_notifications_and_movement(tmp_path: P
     assert db["tables"]["security_dispatches"] == 1
     assert db["tables"]["security_notifications"] == 3
     assert db["aws_outbox_pending"] > 0
+
+
+def test_control_room_test_alert_creates_member_incident_and_dispatch(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SENTINEL_DATABASE_PATH", str(tmp_path / "test-alert.db"))
+    client = TestClient(app)
+
+    created = client.post("/api/security/dispatch/test-alert")
+    assert created.status_code == 200
+    payload = created.json()
+    assert payload["origin_household"] == "10 Killarney Avenue"
+    assert payload["member_incident_id"] == payload["demo_incident"]["incident_id"]
+    assert payload["status"] == "AWAITING_ACKNOWLEDGEMENT"
+    assert len(payload["demo_incident"]["notifications"]) == 3
+
+    mesh = client.get("/api/member/mesh-state").json()
+    assert mesh["active_incidents"][0]["origin_household"] == "10 Killarney Avenue"

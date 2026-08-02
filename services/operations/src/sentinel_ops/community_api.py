@@ -117,7 +117,7 @@ def initialise_community_store() -> None:
         if count == 0:
             seed = [
                 ("SEED-LAKEFIELD-1", "Lakefield Response", "Security", "Evening patrol coverage is active around Lakefield and Northmead.", 0, "SEED"),
-                ("SEED-LAKEFIELD-2", "Community member", "Resident", "Ness Avenue cameras are online and sharing reviewed incident events.", 0, "SEED"),
+                ("SEED-LAKEFIELD-2", "Community member", "Resident", "Killarney Avenue cameras are online and sharing reviewed incident events.", 0, "SEED"),
                 ("SEED-LAKEFIELD-3", "MzansiMesh", "Staff", "Confirmed incident matches will alert neighbouring households and the security control room.", 0, "SEED"),
             ]
             base = datetime.now(UTC)

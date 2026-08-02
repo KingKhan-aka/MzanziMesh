@@ -1,9 +1,8 @@
-"""Persistent security-partner patrol and incident-dispatch simulation.
+"""Persistent security-partner patrol and incident dispatch.
 
-The GradHack demo needs a convincing operational view without pretending that live
-security-company GPS feeds or WhatsApp Business credentials are connected.  This
-module therefore provides a deterministic Benoni/Lakefield simulation backed by the
-same SQLite database used by Member and Claims.
+The GradHack demo uses deterministic Benoni/Lakefield patrol positions backed by the
+same SQLite database used by Member and Claims. WhatsApp delivery is real only when
+Meta Cloud API credentials are configured; the application never fabricates a chat.
 
 It models three fictional response companies, six patrol units, claims-style hotspot
 statistics, fuel-aware route recommendations, incident dispatches, notification
@@ -16,25 +15,43 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from sentinel_ops.storage import connect, database_path
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+except ImportError:
+    pass
+
 router = APIRouter(tags=["security dispatch"])
 
 BENONI_CENTRE = {"latitude": -26.18848, "longitude": 28.32078}
-LAKEFIELD_CENTRE = {"latitude": -26.198055, "longitude": 28.310491}
+LAKEFIELD_CENTRE = {"latitude": -26.184622, "longitude": 28.288862}
+
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_CLOUD_PHONE_NUMBER_ID", "").strip()
+WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_CLOUD_ACCESS_TOKEN", "").strip()
+WHATSAPP_RECIPIENT = "".join(ch for ch in os.getenv("WHATSAPP_DEMO_RECIPIENT", "27826502010").strip() if ch.isdigit())
+WHATSAPP_TEMPLATE_NAME = os.getenv("WHATSAPP_CLOUD_TEMPLATE_NAME", "mzansimesh_security_dispatch_v1").strip()
+WHATSAPP_TEMPLATE_LANGUAGE = os.getenv("WHATSAPP_CLOUD_TEMPLATE_LANGUAGE", "en_US").strip()
+WHATSAPP_GRAPH_VERSION = os.getenv("WHATSAPP_GRAPH_VERSION", "v23.0").strip()
 
 # The street names are real Benoni/Lakefield roads, while the points and movement are
 # deliberately approximate for the demo.  Production routing would use a road graph
 # provider and authenticated partner GPS feeds.
 ROAD_NODES: list[dict[str, Any]] = [
-    {"node_id": "RD-SHER", "street": "Sher Avenue", "latitude": -26.198055, "longitude": 28.310491},
+    {"node_id": "RD-SHER", "street": "Killarney Avenue", "latitude": -26.184622, "longitude": 28.288862},
     {"node_id": "RD-LAKEFIELD", "street": "Lakefield Avenue", "latitude": -26.19395, "longitude": 28.30670},
     {"node_id": "RD-SUNNYSIDE", "street": "Sunnyside Avenue", "latitude": -26.19180, "longitude": 28.30930},
     {"node_id": "RD-SHONGWENI", "street": "Shongweni Street", "latitude": -26.20055, "longitude": 28.30720},
@@ -134,6 +151,88 @@ def _json(value: str | None, fallback: Any = None) -> Any:
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):
         return fallback
+
+
+def _whatsapp_configuration() -> dict[str, Any]:
+    required = {
+        "WHATSAPP_CLOUD_PHONE_NUMBER_ID": WHATSAPP_PHONE_NUMBER_ID,
+        "WHATSAPP_CLOUD_ACCESS_TOKEN": WHATSAPP_ACCESS_TOKEN,
+        "WHATSAPP_DEMO_RECIPIENT": WHATSAPP_RECIPIENT,
+        "WHATSAPP_CLOUD_TEMPLATE_NAME": WHATSAPP_TEMPLATE_NAME,
+    }
+    missing = [name for name, value in required.items() if not value]
+    return {
+        "configured": not missing,
+        "provider": "Meta WhatsApp Cloud API",
+        "sender": "MzansiMesh Security",
+        "recipient": f"+{WHATSAPP_RECIPIENT}" if WHATSAPP_RECIPIENT else None,
+        "template": WHATSAPP_TEMPLATE_NAME or None,
+        "language": WHATSAPP_TEMPLATE_LANGUAGE,
+        "graph_version": WHATSAPP_GRAPH_VERSION,
+        "missing": missing,
+    }
+
+
+def _send_whatsapp_template(notification: dict[str, Any], dispatch: dict[str, Any]) -> dict[str, Any]:
+    config = _whatsapp_configuration()
+    if not config["configured"]:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "WhatsApp Business is not configured. No message was sent.",
+                "missing": config["missing"],
+            },
+        )
+    parameters = [
+        str(dispatch.get("priority") or "HIGH"),
+        str(dispatch.get("address") or "the reported property"),
+        str(dispatch.get("selected_unit_id") or notification.get("unit_id") or "response unit"),
+        f"{float(dispatch.get('eta_minutes') or 0):.1f}",
+        str(dispatch.get("dispatch_id") or notification.get("dispatch_id") or "pending"),
+    ]
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": WHATSAPP_RECIPIENT,
+        "type": "template",
+        "template": {
+            "name": WHATSAPP_TEMPLATE_NAME,
+            "language": {"code": WHATSAPP_TEMPLATE_LANGUAGE},
+            "components": [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": value} for value in parameters],
+            }],
+        },
+    }
+    request = Request(
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            provider_error = json.loads(exc.read().decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            provider_error = {"status": exc.code}
+        raise HTTPException(status_code=502, detail={"message": "Meta rejected the WhatsApp message.", "provider": provider_error}) from exc
+    except (URLError, TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail={"message": "WhatsApp Cloud API could not be reached."}) from exc
+    message_id = (result.get("messages") or [{}])[0].get("id")
+    return {
+        "provider": "Meta WhatsApp Cloud API",
+        "message_id": message_id,
+        "recipient": f"+{WHATSAPP_RECIPIENT}",
+        "template": WHATSAPP_TEMPLATE_NAME,
+        "accepted": bool(message_id),
+        "raw": result,
+    }
 
 
 def _row(row: Any) -> dict[str, Any] | None:
@@ -661,7 +760,10 @@ def _route_for_unit(db, unit_id: str, *, max_stops: int = 4, incident: dict[str,
         })
         current = points[-1]
 
-    remaining = hotspots[:]
+    # An active incident route has one job: get the responder to the latest
+    # confirmed location. Hotspot patrol stops resume only after the response is
+    # closed, so they must not lengthen or visually confuse an emergency route.
+    remaining = [] if incident else hotspots[:]
     while remaining and len(selected) < max_stops:
         def score(h: dict[str, Any]) -> float:
             distance = _distance_km(current["latitude"], current["longitude"], h["latitude"], h["longitude"])
@@ -756,7 +858,7 @@ def _create_notification(db, dispatch: dict[str, Any], unit: dict[str, Any], *, 
         "Acknowledge in MzansiMesh before dispatch. Do not infer identity from biometric matching."
     )
     provider = {
-        "provider": "WhatsApp Business API placeholder",
+        "provider": "Meta WhatsApp Cloud API",
         "to": unit.get("operations_contact"),
         "template": "mzansimesh_security_dispatch_v1",
         "parameters": {
@@ -765,7 +867,7 @@ def _create_notification(db, dispatch: dict[str, Any], unit: dict[str, Any], *, 
             "priority": dispatch["priority"],
             "eta_minutes": round(float(unit["eta_minutes"]), 1),
         },
-        "production_note": "Replace local queue with an approved WhatsApp Business provider/webhook.",
+        "production_note": "Requires the configured MzansiMesh Business sender and approved template before delivery.",
     }
     db.execute(
         """
@@ -938,6 +1040,82 @@ def queue_repeat_intruder_notifications(
     if duplicate:
         return dispatch
 
+    # A repeat match can happen at a different household. Move the active incident
+    # marker and recompute the primary route from the unit's latest simulated GPS
+    # position before the control-room notification is shown.
+    latest_sighting = db.execute(
+        """
+        SELECT s.latitude, s.longitude, c.suburb
+        FROM face_sightings s
+        JOIN member_cameras c ON c.camera_id=s.camera_id
+        WHERE s.sighting_id=?
+        """,
+        (sighting_id,),
+    ).fetchone()
+    route_refreshed = False
+    if latest_sighting and dispatch.get("selected_unit_id"):
+        latest_address = f"{household}, {latest_sighting['suburb']}"
+        incident_target = {
+            "dispatch_id": dispatch_id,
+            "latitude": float(latest_sighting["latitude"]),
+            "longitude": float(latest_sighting["longitude"]),
+            "address": latest_address,
+        }
+        route = _route_for_unit(
+            db,
+            dispatch["selected_unit_id"],
+            max_stops=3,
+            incident=incident_target,
+        )
+        unit_row = db.execute(
+            "SELECT latitude, longitude, fuel_l_per_100km FROM security_units WHERE unit_id=?",
+            (dispatch["selected_unit_id"],),
+        ).fetchone()
+        direct_distance = _distance_km(
+            float(unit_row["latitude"]),
+            float(unit_row["longitude"]),
+            float(latest_sighting["latitude"]),
+            float(latest_sighting["longitude"]),
+        )
+        eta_minutes = max(1.0, direct_distance / 38.0 * 60.0 + 1.2)
+        fuel_litres = direct_distance * float(unit_row["fuel_l_per_100km"]) / 100.0
+        db.execute(
+            """
+            UPDATE security_dispatches
+            SET address=?, latitude=?, longitude=?, route_json=?, distance_km=?,
+                eta_minutes=?, estimated_fuel_litres=?, protected_risk=?, coverage_percent=?
+            WHERE dispatch_id=?
+            """,
+            (
+                latest_address,
+                float(latest_sighting["latitude"]),
+                float(latest_sighting["longitude"]),
+                _safe_json(route["points"]),
+                round(direct_distance, 2),
+                round(eta_minutes, 1),
+                round(fuel_litres, 3),
+                route["protected_risk"],
+                route["coverage_percent"],
+                dispatch_id,
+            ),
+        )
+        db.execute(
+            """
+            UPDATE security_units
+            SET route_json=?, route_index=0, route_kind='INCIDENT_RESPONSE',
+                assigned_hotspot_id=?, updated_at=?
+            WHERE unit_id=?
+            """,
+            (
+                _safe_json(route["points"]),
+                route["hotspot_ids"][0] if route["hotspot_ids"] else None,
+                _now(),
+                dispatch["selected_unit_id"],
+            ),
+        )
+        dispatch = _dispatch_payload(db, dispatch_id) or dispatch
+        route_refreshed = True
+
     unit_ids = [dispatch.get("selected_unit_id"), *(dispatch.get("backup_unit_ids") or [])]
     unit_ids = [item for item in unit_ids if item]
     now = _now()
@@ -958,10 +1136,11 @@ def queue_repeat_intruder_notifications(
             "MZANSIMESH REPEAT INTRUDER ALERT\n"
             f"Active-watch match at {household}\n"
             f"Dispatch {dispatch_id} | sighting {sighting_id}\n"
-            "Neighbour cameras remain armed. Review the updated movement trail and acknowledge in MzansiMesh."
+            f"Response route {'refreshed to the latest sighting' if route_refreshed else 'ready for review'}. "
+            "Neighbour cameras remain armed. Review and acknowledge in MzansiMesh."
         )
         provider = {
-            "provider": "WhatsApp Business API placeholder",
+            "provider": "Meta WhatsApp Cloud API",
             "to": unit.get("operations_contact"),
             "template": "mzansimesh_repeat_intruder_v1",
             "parameters": {
@@ -986,10 +1165,10 @@ def queue_repeat_intruder_notifications(
     _activity(
         db,
         "REPEAT_INTRUDER_ALERTED",
-        "Repeat intruder match sent to control room",
-        f"Active-watch match at {household}; security notifications queued for {len(unit_ids)} unit(s).",
+        "Repeat match refreshed the response route" if route_refreshed else "Repeat intruder match sent to control room",
+        f"Active-watch match at {household}; route {'refreshed and ' if route_refreshed else ''}notifications queued for {len(unit_ids)} unit(s).",
         actor=actor,
-        payload={"incident_id": incident_id, "dispatch_id": dispatch_id, "sighting_id": sighting_id, "household": household},
+        payload={"incident_id": incident_id, "dispatch_id": dispatch_id, "sighting_id": sighting_id, "household": household, "route_refreshed": route_refreshed},
     )
     return _dispatch_payload(db, dispatch_id) or dispatch
 
@@ -1148,7 +1327,7 @@ def security_operations():
             "aws_outbox_pending": outbox,
         },
         "activity": recent_activity,
-        "simulation_note": "Partner GPS and WhatsApp delivery are simulated for the POC. Member incident tracks and repeat-camera matches are read live from SQLite and layered onto the map and hotspot priorities.",
+        "simulation_note": "Partner GPS remains simulated for the POC. WhatsApp is sent only through a configured Meta Cloud API sender; otherwise notifications remain queued and no external message is fabricated.",
         "privacy_note": "Security receives operational location and priority only; member names, claim amounts and raw biometric media are excluded.",
     }
 
@@ -1241,6 +1420,25 @@ def dispatch_from_latest_member():
         return create_dispatch_for_member_incident(db, row["incident_id"])
 
 
+@router.post("/api/security/dispatch/test-alert")
+def create_test_security_alert():
+    """Create a realistic demo incident at one of the three member homes."""
+    from sentinel_ops.member_mesh import create_demo_intruder_incident
+
+    incident = create_demo_intruder_incident("Security control-room demo")
+    initialise_security_store()
+    with connect() as db:
+        dispatch = create_dispatch_for_member_incident(
+            db,
+            incident["incident_id"],
+            actor="Security control-room demo",
+        )
+    return dispatch | {
+        "demo_incident": incident,
+        "origin_household": incident["origin_household"],
+    }
+
+
 @router.post("/api/security/dispatches/{dispatch_id}/acknowledge")
 def acknowledge_dispatch(dispatch_id: str, body: AcknowledgeIn):
     initialise_security_store()
@@ -1249,26 +1447,79 @@ def acknowledge_dispatch(dispatch_id: str, body: AcknowledgeIn):
         if not dispatch:
             raise HTTPException(status_code=404, detail="dispatch not found")
         now = _now()
+        route_update = None
+        if dispatch.get("selected_unit_id"):
+            # The notification may have been waiting while patrols moved. Rebuild
+            # the response from the unit's current position at the exact moment a
+            # controller acknowledges it, then persist that route for movement.
+            route_update = _route_for_unit(
+                db,
+                dispatch["selected_unit_id"],
+                max_stops=3,
+                incident=dispatch,
+            )
+            unit_row = db.execute(
+                "SELECT latitude, longitude, fuel_l_per_100km FROM security_units WHERE unit_id=?",
+                (dispatch["selected_unit_id"],),
+            ).fetchone()
+            direct_distance = _distance_km(
+                float(unit_row["latitude"]),
+                float(unit_row["longitude"]),
+                float(dispatch["latitude"]),
+                float(dispatch["longitude"]),
+            )
+            eta_minutes = max(1.0, direct_distance / 38.0 * 60.0 + 1.2)
+            fuel_litres = direct_distance * float(unit_row["fuel_l_per_100km"]) / 100.0
+            db.execute(
+                """
+                UPDATE security_units
+                SET status='RESPONDING', route_json=?, route_index=0,
+                    route_kind='INCIDENT_RESPONSE', active_dispatch_id=?,
+                    assigned_hotspot_id=?, updated_at=?
+                WHERE unit_id=?
+                """,
+                (
+                    _safe_json(route_update["points"]),
+                    dispatch_id,
+                    route_update["hotspot_ids"][0] if route_update["hotspot_ids"] else None,
+                    now,
+                    dispatch["selected_unit_id"],
+                ),
+            )
+            db.execute(
+                """
+                UPDATE security_dispatches
+                SET route_json=?, distance_km=?, eta_minutes=?, estimated_fuel_litres=?,
+                    protected_risk=?, coverage_percent=?
+                WHERE dispatch_id=?
+                """,
+                (
+                    _safe_json(route_update["points"]),
+                    round(direct_distance, 2),
+                    round(eta_minutes, 1),
+                    round(fuel_litres, 3),
+                    route_update["protected_risk"],
+                    route_update["coverage_percent"],
+                    dispatch_id,
+                ),
+            )
         db.execute(
             "UPDATE security_dispatches SET status='ACKNOWLEDGED', acknowledged_at=? WHERE dispatch_id=?",
             (now, dispatch_id),
         )
-        if dispatch.get("selected_unit_id"):
-            db.execute(
-                "UPDATE security_units SET status='RESPONDING', updated_at=? WHERE unit_id=?",
-                (now, dispatch["selected_unit_id"]),
-            )
         db.execute(
             "UPDATE security_notifications SET status='ACKNOWLEDGED_IN_APP', delivered_at=COALESCE(delivered_at, ?) WHERE dispatch_id=?",
             (now, dispatch_id),
         )
         _activity(
-            db, "DISPATCH_ACKNOWLEDGED", "Control room acknowledged incident",
-            f"{dispatch_id} acknowledged by {body.acknowledged_by}.", actor=body.acknowledged_by,
-            payload={"dispatch_id": dispatch_id},
+            db, "DISPATCH_ACKNOWLEDGED", "Response acknowledged and route refreshed",
+            f"{dispatch_id} acknowledged by {body.acknowledged_by}; {dispatch.get('selected_unit_id') or 'selected unit'} routed from its latest position.", actor=body.acknowledged_by,
+            payload={"dispatch_id": dispatch_id, "route_refreshed": bool(route_update)},
         )
         _queue_entity(db, "security_dispatches", dispatch_id, "UPDATE", {"status": "ACKNOWLEDGED", "acknowledged_at": now}, body.acknowledged_by)
         payload = _dispatch_payload(db, dispatch_id)
+        if payload is not None and route_update is not None:
+            payload["route_update"] = route_update | {"recalculated_on_acknowledgement": True}
     return payload
 
 
@@ -1277,6 +1528,66 @@ def close_dispatch(dispatch_id: str, body: DispatchCloseIn):
     initialise_security_store()
     with connect() as db:
         return _close_dispatch_in_db(db, dispatch_id, actor=body.closed_by, reason=body.reason)
+
+
+@router.get("/api/security/whatsapp/status")
+def whatsapp_status():
+    """Report whether a real Meta WhatsApp Business sender is configured."""
+    return _whatsapp_configuration()
+
+
+@router.post("/api/security/notifications/{notification_id}/send-whatsapp")
+def send_notification_whatsapp(notification_id: str):
+    """Send one approved template from the configured MzansiMesh Business sender."""
+    initialise_security_store()
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM security_notifications WHERE notification_id=?",
+            (notification_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="notification not found")
+        notification = dict(row)
+        dispatch = _dispatch_payload(db, notification["dispatch_id"])
+        if not dispatch:
+            raise HTTPException(status_code=404, detail="dispatch not found")
+        provider_result = _send_whatsapp_template(notification, dispatch)
+        now = _now()
+        stored_payload = _json(notification.get("provider_payload_json"), {}) or {}
+        stored_payload["real_delivery"] = provider_result
+        db.execute(
+            """
+            UPDATE security_notifications
+            SET status='SENT_TO_PROVIDER', provider_payload_json=?
+            WHERE notification_id=?
+            """,
+            (_safe_json(stored_payload), notification_id),
+        )
+        _activity(
+            db,
+            "WHATSAPP_SENT_TO_PROVIDER",
+            "Real WhatsApp message accepted",
+            f"{notification_id} was accepted by Meta for {provider_result['recipient']}.",
+            actor="MzansiMesh Security",
+            payload={
+                "notification_id": notification_id,
+                "message_id": provider_result.get("message_id"),
+                "recipient": provider_result["recipient"],
+            },
+        )
+        _queue_entity(
+            db,
+            "security_notifications",
+            notification_id,
+            "UPDATE",
+            {"status": "SENT_TO_PROVIDER", "provider_message_id": provider_result.get("message_id")},
+            "MzansiMesh Security",
+        )
+        item = dict(db.execute(
+            "SELECT * FROM security_notifications WHERE notification_id=?",
+            (notification_id,),
+        ).fetchone())
+    return item | {"provider": provider_result, "provider_payload": _json(item.get("provider_payload_json"), {})}
 
 
 @router.post("/api/security/notifications/{notification_id}/simulate-send")

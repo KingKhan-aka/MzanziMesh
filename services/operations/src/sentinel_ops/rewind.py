@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from sentinel_ops.geo import haversine_km
 from sentinel_ops.models import IncidentTimeline, ReconstructRequest, TimelineItem
@@ -10,17 +10,28 @@ def _norm(value: str | None) -> str:
     return "".join(ch for ch in (value or "").upper() if ch.isalnum())
 
 
+SAST = timezone(timedelta(hours=2))
+
+
+def _in_sast(value: datetime) -> datetime:
+    """Treat workbook timestamps as local and normalise camera timestamps."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=SAST)
+    return value.astimezone(SAST)
+
+
 def reconstruct_incident(request: ReconstructRequest) -> IncidentTimeline:
-    start = request.claim.incident_time - timedelta(
+    incident_time = _in_sast(request.claim.incident_time)
+    start = incident_time - timedelta(
         minutes=request.minutes_before
     )
-    end = request.claim.incident_time + timedelta(
+    end = incident_time + timedelta(
         minutes=request.minutes_after
     )
     items: list[TimelineItem] = []
 
     for event in request.events:
-        if not start <= event.timestamp <= end:
+        if not start <= _in_sast(event.timestamp) <= end:
             continue
         distance = haversine_km(request.claim.location, event.location)
         if distance > request.radius_km:

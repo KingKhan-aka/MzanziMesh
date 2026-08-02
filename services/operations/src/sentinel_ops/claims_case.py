@@ -232,7 +232,7 @@ def _parse_datetime(value: str | None, fallback: datetime | None = None) -> date
     return fallback or datetime.now().astimezone()
 
 
-def _camera_inbox_uploads() -> list[dict[str, Any]]:
+def _camera_inbox_uploads(source_claim_id: str | None = None) -> list[dict[str, Any]]:
     try:
         payload = json.loads(CAMERA_INBOX_FIXTURE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -243,6 +243,9 @@ def _camera_inbox_uploads() -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for item in uploads:
         if not isinstance(item, dict):
+            continue
+        target_claims = item.get("source_claim_ids") or []
+        if source_claim_id is not None and target_claims and source_claim_id not in target_claims:
             continue
         relative = str(item.get("relative_media_path") or "")
         path = (REPO_ROOT / relative).resolve()
@@ -555,7 +558,79 @@ def _get_case(case_id: str) -> dict[str, Any]:
         row = _row(db.execute("SELECT * FROM claim_cases WHERE case_id=?", (case_id,)).fetchone())
     if not row:
         raise HTTPException(status_code=404, detail="case not found")
-    row["claim"] = _json(row.pop("claim_json"), {})
+    row["claim"] = _enrich_demo_claim(_json(row.pop("claim_json"), {}))
+    return row
+
+
+def _enrich_demo_claim(claim: dict[str, Any]) -> dict[str, Any]:
+    """Add deterministic, deliberately imperfect demo intake data.
+
+    The historical workbook contains loss facts but not the operational documents a
+    claims reviewer would normally check. These fields simulate that intake layer;
+    they are stable per claim and intentionally include missing and mismatched data.
+    """
+    row = dict(claim)
+    claim_id = str(row.get("incident_id") or "INC-000")
+    digits = "".join(ch for ch in claim_id if ch.isdigit())
+    seed = int(digits or 0)
+    incident_at = str(row.get("incident_at") or "")
+    year = incident_at[:4] if len(incident_at) >= 4 else "2026"
+    suburb = str(row.get("suburb") or "Central").title()
+    peril = str(row.get("peril") or "").lower()
+    police_required = any(word in peril for word in ("theft", "hijack", "burglary", "robbery", "invasion"))
+
+    police_mode = seed % 10
+    if not police_required:
+        police_reference, police_status = None, "NOT_REQUIRED"
+    elif police_mode in {0, 6}:
+        police_reference, police_status = None, "MISSING"
+    elif police_mode == 1:
+        police_reference, police_status = f"CAS {900 + seed % 80}/13/{year}", "MALFORMED"
+    elif police_mode == 2:
+        police_reference, police_status = f"CAS {120 + seed % 700}/06/{year}", "MISMATCH"
+    else:
+        police_reference, police_status = f"CAS {120 + seed % 700}/{(seed % 12) + 1:02d}/{year} - {suburb} SAPS", "VERIFIED"
+
+    identity_status = "MISSING" if seed % 17 == 0 else "MISMATCH" if seed % 23 == 0 else "VERIFIED"
+    policy_status = "MISSING" if seed % 19 == 0 else "LAPSED" if seed % 13 == 0 else "ACTIVE"
+    ownership_status = "MISSING" if seed % 11 == 0 else "MISMATCH" if seed % 29 == 0 else "VERIFIED"
+    documents_status = "MISSING" if seed % 14 == 0 else "PARTIAL" if seed % 5 == 0 else "COMPLETE"
+    received_documents = ["Claim form", "Identity document"]
+    if documents_status == "COMPLETE":
+        received_documents.extend(["Proof of ownership", "Loss statement"])
+        if police_required:
+            received_documents.append("SAPS report")
+    elif documents_status == "PARTIAL":
+        received_documents.append("Loss statement")
+
+    defaults = {
+        "policy_number": f"POL-GP-{100000 + seed:06d}" if policy_status != "MISSING" else None,
+        "policy_status": policy_status,
+        "claimant_identity_status": identity_status,
+        "ownership_status": ownership_status,
+        "documents_status": documents_status,
+        "received_documents": received_documents,
+        "police_report_required": police_required,
+        "police_case_number": police_reference,
+        "police_reference_status": police_status,
+        "demo_intake_data": True,
+    }
+    for key, value in defaults.items():
+        row.setdefault(key, value)
+
+    # The supplied real clip is scoped to one vehicle claim so it never appears
+    # as generic evidence on unrelated cases.
+    if claim_id == "INC-002":
+        row.update({
+            "reported_plate": "DV70FTGP",
+            "police_case_number": f"CAS 122/06/{year} - Boksburg SAPS",
+            "police_reference_status": "VERIFIED",
+            "policy_status": "ACTIVE",
+            "claimant_identity_status": "VERIFIED",
+            "ownership_status": "VERIFIED",
+            "documents_status": "COMPLETE",
+            "received_documents": ["Claim form", "Identity document", "Proof of ownership", "Loss statement", "SAPS report"],
+        })
     return row
 
 
@@ -593,10 +668,10 @@ def _create_case(claim: dict[str, Any], source_type: str, member_incident_id: st
             """
             INSERT INTO claim_cases(
                 case_id, source_claim_id, member_incident_id, source_type, status, stage,
-                priority, claim_json, opened_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'OPEN', 'TRIAGE', 'ROUTINE', ?, ?, ?)
+                priority, reported_plate, claim_json, opened_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'OPEN', 'TRIAGE', 'ROUTINE', ?, ?, ?, ?)
             """,
-            (case_id, source_claim_id, member_incident_id, source_type, _safe_json(claim), now, now),
+            (case_id, source_claim_id, member_incident_id, source_type, claim.get("reported_plate"), _safe_json(claim), now, now),
         )
         _ensure_validations(db, case_id, claim)
         _activity(
@@ -767,12 +842,85 @@ def case_queue(
     limit: int = Query(120, ge=1, le=500),
 ):
     initialise_claim_store()
-    historical = list(claims())
+    historical = [_enrich_demo_claim(row) for row in claims()]
     with connect() as db:
         case_rows = [dict(row) for row in db.execute("SELECT * FROM claim_cases").fetchall()]
+        latest_agents: dict[str, dict[str, Any]] = {}
+        for row in db.execute(
+            "SELECT case_id, status, readiness_score, recommendation, completed_at "
+            "FROM claim_agent_runs ORDER BY completed_at DESC"
+        ).fetchall():
+            item = dict(row)
+            latest_agents.setdefault(item["case_id"], item)
+        validation_summaries = {
+            row["case_id"]: dict(row) for row in db.execute(
+                """
+                SELECT case_id, COUNT(*) AS checks_total,
+                       SUM(CASE WHEN status IN ('VERIFIED','NOT_APPLICABLE') THEN 1 ELSE 0 END) AS checks_complete,
+                       SUM(CASE WHEN status IN ('MISSING','MISMATCH') THEN 1 ELSE 0 END) AS checks_attention
+                FROM claim_case_validations
+                WHERE check_code!='HUMAN_REVIEW'
+                GROUP BY case_id
+                """
+            ).fetchall()
+        }
+        evidence_counts = {
+            row["case_id"]: int(row["count"]) for row in db.execute(
+                "SELECT case_id, COUNT(*) AS count FROM claim_evidence_links GROUP BY case_id"
+            ).fetchall()
+        }
+        video_summaries = {
+            row["case_id"]: dict(row) for row in db.execute(
+                """
+                SELECT case_id, COUNT(*) AS video_count,
+                       SUM(CASE WHEN status='PROCESSED' THEN 1 ELSE 0 END) AS videos_processed
+                FROM claim_camera_uploads GROUP BY case_id
+                """
+            ).fetchall()
+        }
+        ocr_counts = {
+            row["case_id"]: int(row["count"]) for row in db.execute(
+                "SELECT case_id, COUNT(*) AS count FROM claim_plate_observations GROUP BY case_id"
+            ).fetchall()
+        }
+        report_versions = {
+            row["case_id"]: int(row["version"]) for row in db.execute(
+                "SELECT case_id, MAX(version) AS version FROM claim_case_reports GROUP BY case_id"
+            ).fetchall()
+        }
     by_source = {row["source_claim_id"]: row for row in case_rows}
     historical_ids = {str(row["incident_id"]) for row in historical}
     rows: list[dict[str, Any]] = []
+
+    def review_state(case: dict[str, Any] | None) -> dict[str, Any]:
+        if not case:
+            return {
+                "ai_status": "NOT_STARTED", "ai_readiness_score": None,
+                "ai_recommendation": None, "checks_complete": 0,
+                "checks_total": len(VALIDATION_LIBRARY) - 1, "checks_attention": 0,
+                "evidence_count": 0, "video_count": 0, "videos_processed": 0,
+                "ocr_count": 0, "report_ready": False, "report_version": None,
+            }
+        case_id = case["case_id"]
+        agent = latest_agents.get(case_id)
+        checks = validation_summaries.get(case_id, {})
+        videos = video_summaries.get(case_id, {})
+        report_version = report_versions.get(case_id)
+        return {
+            "ai_status": (agent or {}).get("status", "NOT_STARTED"),
+            "ai_readiness_score": (agent or {}).get("readiness_score"),
+            "ai_recommendation": (agent or {}).get("recommendation"),
+            "checks_complete": int(checks.get("checks_complete") or 0),
+            "checks_total": int(checks.get("checks_total") or len(VALIDATION_LIBRARY) - 1),
+            "checks_attention": int(checks.get("checks_attention") or 0),
+            "evidence_count": evidence_counts.get(case_id, 0),
+            "video_count": int(videos.get("video_count") or 0),
+            "videos_processed": int(videos.get("videos_processed") or 0),
+            "ocr_count": ocr_counts.get(case_id, 0),
+            "report_ready": report_version is not None,
+            "report_version": report_version,
+        }
+
     for claim in historical:
         case = by_source.get(str(claim["incident_id"]))
         rows.append({
@@ -783,6 +931,7 @@ def case_queue(
             "case_priority": case["priority"] if case else "UNASSESSED",
             "assigned_to": case["assigned_to"] if case else None,
             "source_type": "WORKBOOK",
+            **review_state(case),
         })
     for case in case_rows:
         if case["source_claim_id"] in historical_ids:
@@ -796,6 +945,7 @@ def case_queue(
             "case_priority": case["priority"],
             "assigned_to": case["assigned_to"],
             "source_type": case["source_type"],
+            **review_state(case),
         })
 
     def keep(c: dict[str, Any]) -> bool:
@@ -808,7 +958,8 @@ def case_queue(
         if q:
             hay = " ".join(str(c.get(k) or "") for k in (
                 "incident_id", "suburb", "peril", "vehicle_make", "vehicle_model",
-                "case_status", "case_priority", "assigned_to",
+                "case_status", "case_priority", "assigned_to", "police_case_number",
+                "policy_number",
             ))
             if q.lower() not in hay.lower():
                 return False
@@ -839,7 +990,7 @@ def case_queue(
 
 @router.post("/api/fraud/cases/open/{source_claim_id}")
 def open_case(source_claim_id: str):
-    claim = next((row for row in claims() if str(row["incident_id"]) == source_claim_id), None)
+    claim = next((_enrich_demo_claim(row) for row in claims() if str(row["incident_id"]) == source_claim_id), None)
     if not claim:
         with connect() as db:
             existing = db.execute(
@@ -1677,13 +1828,17 @@ def demo_camera_media(filename: str):
     target = (CAMERA_INBOX_MEDIA_ROOT / safe_name).resolve()
     if safe_name not in allowed or not target.is_file() or target.parent != CAMERA_INBOX_MEDIA_ROOT.resolve():
         raise HTTPException(status_code=404, detail="demo camera clip not found")
-    return FileResponse(target, media_type="video/mp4", filename=safe_name)
+    return FileResponse(
+        target,
+        media_type="video/mp4",
+        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+    )
 
 
 @router.post("/api/fraud/cases/{case_id}/camera-inbox/auto-ingest")
 def auto_ingest_case_camera_inbox(case_id: str):
     case = _get_case(case_id)
-    uploads = _camera_inbox_uploads()
+    uploads = _camera_inbox_uploads(case["source_claim_id"])
     active_source_keys = {str(item.get("source_key")) for item in uploads}
     _remove_obsolete_fixture_uploads(case_id, active_source_keys)
     incident_time = _parse_datetime(case["claim"].get("incident_at"))
@@ -1896,6 +2051,8 @@ def run_case_agent(case_id: str):
     watches = int(stat["assessment"].get("watches") or 0)
     if flags:
         rationale.append({"level": "ATTENTION", "reason": f"{flags} statistical flag(s) require human review."})
+    if watches:
+        rationale.append({"level": "CONTEXT", "reason": f"{watches} contextual watch item(s) remain for the human reviewer."})
 
     # Tool 2: evidence retrieval.
     evidence_result = _refresh_evidence(case_id)
@@ -1911,13 +2068,136 @@ def run_case_agent(case_id: str):
         evidence_count = int(db.execute(
             "SELECT COUNT(*) AS n FROM claim_evidence_links WHERE case_id=?", (case_id,)
         ).fetchone()["n"])
+        processed_video_count = int(db.execute(
+            "SELECT COUNT(*) AS n FROM claim_camera_uploads WHERE case_id=? AND status='PROCESSED'",
+            (case_id,),
+        ).fetchone()["n"])
 
-        pending = [v for v in validations if v["status"] == "PENDING"]
-        missing = [v for v in validations if v["status"] == "MISSING"]
-        mismatches = [v for v in validations if v["status"] == "MISMATCH"]
-        verified = [v for v in validations if v["status"] in {"VERIFIED", "NOT_APPLICABLE"}]
         plate_mismatch = any(p["match_status"] == "MISMATCH" for p in plates)
-        plate_match = any(p["match_status"] in {"MATCH", "CROSS_CAMERA_MATCH"} for p in plates)
+        plate_match = any(p["match_status"] in {
+            "MATCH", "CROSS_CAMERA_MATCH", "POLICY_RECONCILED", "PARTIAL_VISUAL_MATCH",
+        } for p in plates)
+
+        def automated_check(code: str, status: str, value: str | None, note: str) -> None:
+            db.execute(
+                """
+                UPDATE claim_case_validations
+                SET status=?, value=?, note=?, updated_by='Case Agent', updated_at=?
+                WHERE case_id=? AND check_code=?
+                """,
+                (status, value, note, _now(), case_id, code),
+            )
+            for validation in validations:
+                if validation["check_code"] == code:
+                    validation.update({
+                        "status": status, "value": value, "note": note,
+                        "updated_by": "Case Agent",
+                    })
+                    break
+
+        claim_data = case["claim"]
+        identity_status = str(claim_data.get("claimant_identity_status") or "MISSING")
+        automated_check(
+            "CLAIMANT_IDENTITY",
+            "VERIFIED" if identity_status == "VERIFIED" else identity_status,
+            identity_status.replace("_", " ").title(),
+            "Claimant identity fields were checked against the supplied intake record.",
+        )
+
+        policy_status = str(claim_data.get("policy_status") or "MISSING")
+        automated_check(
+            "POLICY_ACTIVE",
+            "VERIFIED" if policy_status == "ACTIVE" else "MISSING" if policy_status == "MISSING" else "MISMATCH",
+            claim_data.get("policy_number") or "No policy number supplied",
+            "Policy was active at the incident time." if policy_status == "ACTIVE" else f"Policy intake status is {policy_status.lower()} and requires review.",
+        )
+
+        police_status = str(claim_data.get("police_reference_status") or "MISSING")
+        police_validation_status = {
+            "VERIFIED": "VERIFIED",
+            "NOT_REQUIRED": "NOT_APPLICABLE",
+            "MISSING": "MISSING",
+            "MALFORMED": "MISMATCH",
+            "MISMATCH": "MISMATCH",
+        }.get(police_status, "PENDING")
+        automated_check(
+            "POLICE_REFERENCE",
+            police_validation_status,
+            claim_data.get("police_case_number") or "No SAPS reference supplied",
+            {
+                "VERIFIED": "The SAPS case reference has the expected case/month/year and station structure.",
+                "NOT_REQUIRED": "A police reference is not required for this incident type.",
+                "MISSING": "The claim is reportable but no SAPS case reference was supplied.",
+                "MALFORMED": "The supplied SAPS reference contains an invalid month or structure.",
+                "MISMATCH": "The supplied SAPS reference does not reconcile with the intake record.",
+            }.get(police_status, "The SAPS reference could not be resolved automatically."),
+        )
+
+        ownership_status = str(claim_data.get("ownership_status") or "MISSING")
+        automated_check(
+            "OWNERSHIP",
+            "VERIFIED" if ownership_status == "VERIFIED" else ownership_status,
+            ownership_status.replace("_", " ").title(),
+            "Ownership or insurable-interest documentation was checked against the claim.",
+        )
+
+        documents_status = str(claim_data.get("documents_status") or "MISSING")
+        documents = claim_data.get("received_documents") or []
+        automated_check(
+            "SUPPORTING_DOCUMENTS",
+            "VERIFIED" if documents_status == "COMPLETE" else "MISSING",
+            ", ".join(str(item) for item in documents) or "No documents supplied",
+            "Required documents are present." if documents_status == "COMPLETE" else f"Document intake is {documents_status.lower()}; request the outstanding items.",
+        )
+
+        if claim_data.get("incident_at"):
+            automated_check(
+                "INCIDENT_TIME", "VERIFIED", str(claim_data["incident_at"]),
+                "Incident timestamp is present and precise enough for the evidence window.",
+            )
+        if claim_data.get("peril") and claim_data.get("suburb") and claim_data.get("item_type"):
+            automated_check(
+                "INCIDENT_DESCRIPTION", "VERIFIED",
+                f"{claim_data['peril']} · {claim_data['item_type']} · {claim_data['suburb']}",
+                "Core incident fields are present and internally usable.",
+            )
+        if evidence_count or processed_video_count:
+            automated_check(
+                "CAMERA_EVIDENCE", "VERIFIED",
+                f"{processed_video_count} video clip(s); {evidence_count} linked event(s)",
+                "Available camera material was processed and included in the review pack.",
+            )
+        else:
+            automated_check(
+                "CAMERA_EVIDENCE", "PENDING", "No video supplied",
+                "No camera video is attached. The human reviewer can request it if the claim requires it.",
+            )
+        if (claim_data.get("item_type") or "").lower() != "vehicle":
+            automated_check(
+                "PLATE_MATCH", "NOT_APPLICABLE", None,
+                "Number-plate OCR is not applicable to this non-vehicle claim.",
+            )
+        elif plate_mismatch:
+            automated_check(
+                "PLATE_MATCH", "MISMATCH", None,
+                "OCR observations conflict and require human review.",
+            )
+        elif plate_match:
+            automated_check(
+                "PLATE_MATCH", "VERIFIED", f"{len(plates)} OCR observation(s)",
+                "Available registration observations support the reported vehicle details.",
+            )
+        else:
+            automated_check(
+                "PLATE_MATCH", "PENDING", "Awaiting readable video",
+                "No reliable number-plate observation is available yet.",
+            )
+
+        automated_validations = [v for v in validations if v["check_code"] != "HUMAN_REVIEW"]
+        pending = [v for v in automated_validations if v["status"] == "PENDING"]
+        missing = [v for v in automated_validations if v["status"] == "MISSING"]
+        mismatches = [v for v in automated_validations if v["status"] == "MISMATCH"]
+        verified = [v for v in automated_validations if v["status"] in {"VERIFIED", "NOT_APPLICABLE"}]
 
         if missing:
             rationale.append({"level": "BLOCKER", "reason": f"{len(missing)} required validation(s) are marked missing."})
@@ -1937,8 +2217,8 @@ def run_case_agent(case_id: str):
         if evidence_count:
             rationale.append({"level": "SUPPORT", "reason": f"{evidence_count} evidence item(s) are linked and auditable."})
 
-        applicable = max(1, len([v for v in validations if v["status"] != "NOT_APPLICABLE"]))
-        readiness = 20 + 55 * len([v for v in validations if v["status"] == "VERIFIED"]) / applicable
+        applicable = max(1, len([v for v in automated_validations if v["status"] != "NOT_APPLICABLE"]))
+        readiness = 20 + 55 * len([v for v in automated_validations if v["status"] == "VERIFIED"]) / applicable
         readiness += min(15, evidence_count * 3)
         readiness += 10 if plate_match else 0
         readiness -= 15 * len(missing)
@@ -1995,6 +2275,12 @@ def record_case_decision(case_id: str, body: DecisionUpdate):
     stage = "CLOSED" if status == "CLOSED" else "ESCALATED"
     now = _now()
     with connect() as db:
+        db.execute(
+            """UPDATE claim_case_validations
+               SET status='VERIFIED', value=?, note=?, updated_by=?, updated_at=?
+               WHERE case_id=? AND check_code='HUMAN_REVIEW'""",
+            (body.decision.replace("_", " ").title(), body.rationale, body.updated_by, now, case_id),
+        )
         db.execute(
             "UPDATE claim_cases SET status=?, stage=?, updated_at=?, closed_at=? WHERE case_id=?",
             (status, stage, now, now if status == "CLOSED" else None, case_id),

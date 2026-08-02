@@ -111,45 +111,45 @@ _PREPARED_FACE_OBSERVATION: ContextVar[
 # Demo properties are configuration-driven so address changes flow through the
 # database, geocoder and live map together. Override the defaults without editing
 # code by setting MZANSIMESH_DEMO_PROPERTIES_JSON to a JSON array with the same keys.
-# Verified Lakefield demo corridor. 12 Ness Avenue is anchored to a public
-# geocoded property record; the neighbouring demo homes are placed on the same
-# street corridor. The browser never centres on these constants directly: it
+# Verified Lakefield demo corridor. The three neighbouring demo homes are placed
+# on their individually geocoded Killarney Avenue properties. The browser never
+# centres on these constants directly: it
 # always renders coordinates stored in SQLite, so a saved/geocoded address moves
 # the camera and all new events automatically.
 _DEFAULT_DEMO_USERS = [
     {
         "user_id": "USR-001",
-        "display_name": "User 1",
+        "display_name": "Azraa",
         "member_number": "DISC-1001",
-        "household": "10 Ness Avenue",
+        "household": "10 Killarney Avenue",
         "suburb": "Lakefield",
         "metro": "Gauteng",
-        "latitude": -26.181190,
-        "longitude": 28.289980,
+        "latitude": -26.184775,
+        "longitude": 28.289372,
     },
     {
         "user_id": "USR-002",
         "display_name": "User 2",
         "member_number": "DISC-1002",
-        "household": "11 Ness Avenue",
+        "household": "11 Killarney Avenue",
         "suburb": "Lakefield",
         "metro": "Gauteng",
-        "latitude": -26.181510,
-        "longitude": 28.290620,
+        "latitude": -26.184499,
+        "longitude": 28.288230,
     },
     {
         "user_id": "USR-003",
         "display_name": "User 3",
         "member_number": "DISC-1003",
-        "household": "12 Ness Avenue",
+        "household": "12 Killarney Avenue",
         "suburb": "Lakefield",
         "metro": "Gauteng",
-        "latitude": -26.181900,
-        "longitude": 28.291070,
+        "latitude": -26.184591,
+        "longitude": 28.288985,
     },
 ]
 
-# Pass 1 used a Lakefield suburb centroid rather than Ness Avenue. These values
+# Pass 1 used a Lakefield suburb centroid rather than the selected street. These values
 # are retained only so existing demo databases can be migrated once without
 # overwriting a member's later geocoded location.
 _LEGACY_DEMO_COORDINATES = {
@@ -521,9 +521,9 @@ def initialise_member_store() -> None:
         _ensure_column(db, "member_camera_notifications", "viewed_at TEXT")
 
         legacy_households = {
-            "USR-001": "17 Sher Avenue",
-            "USR-002": "18 Sher Avenue",
-            "USR-003": "19 Sher Avenue",
+            "USR-001": ("17 Sher Avenue", "10 Ness Avenue"),
+            "USR-002": ("18 Sher Avenue", "11 Ness Avenue"),
+            "USR-003": ("19 Sher Avenue", "12 Ness Avenue"),
         }
         for user in DEMO_USERS:
             # Seed only missing records. A member's later geocoded address must not be
@@ -541,10 +541,15 @@ def initialise_member_store() -> None:
                     user["latitude"], user["longitude"], _now(),
                 ),
             )
+            if user["user_id"] == "USR-001":
+                db.execute(
+                    "UPDATE member_users SET display_name=? WHERE user_id=? AND display_name='User 1'",
+                    (user["display_name"], user["user_id"]),
+                )
             # One-time migration for the old hardcoded Sher Avenue demo. This only
             # touches untouched legacy rows; user-saved addresses remain unchanged.
-            legacy_household = legacy_households.get(user["user_id"])
-            if legacy_household:
+            prior_households = legacy_households.get(user["user_id"], ())
+            for legacy_household in prior_households:
                 db.execute(
                     """
                     UPDATE member_users
@@ -560,7 +565,7 @@ def initialise_member_store() -> None:
 
             # Pass-1 coordinate repair. If the row still has the exact old
             # suburb-centroid coordinates, move the user, camera and historical
-            # demo sightings onto the configured Ness Avenue position. A member
+            # demo sightings onto the configured Killarney Avenue position. A member
             # who has saved any other geocoded coordinates is left untouched.
             old_coords = _LEGACY_DEMO_COORDINATES.get(user["user_id"])
             if old_coords:
@@ -642,7 +647,18 @@ def initialise_member_store() -> None:
                         (user["latitude"], user["longitude"], camera_id, old_lat, old_lon),
                     )
 
-            if legacy_household:
+            camera_was_legacy = db.execute(
+                "SELECT household FROM member_cameras WHERE camera_id=?",
+                (camera_id,),
+            ).fetchone()
+            camera_needs_address_migration = bool(
+                camera_was_legacy
+                and any(
+                    str(camera_was_legacy["household"]).strip().lower() == item.lower()
+                    for item in prior_households
+                )
+            )
+            for legacy_household in prior_households:
                 db.execute(
                     """
                     UPDATE member_cameras
@@ -655,6 +671,11 @@ def initialise_member_store() -> None:
                         user["latitude"], user["longitude"], mode, hotspot_id, risk,
                         camera_id, legacy_household,
                     ),
+                )
+            if camera_needs_address_migration:
+                db.execute(
+                    "UPDATE face_sightings SET latitude=?, longitude=? WHERE camera_id=?",
+                    (user["latitude"], user["longitude"], camera_id),
                 )
 
             # Keep each demo camera visually distinct until the operator performs
@@ -933,12 +954,11 @@ def _expire_incidents(db: sqlite3.Connection) -> None:
 
 @router.get("/api/member/map-config")
 def member_map_config():
-    """Return browser-safe, no-key map configuration.
+    """Return browser-safe map configuration with a free-map fallback.
 
-    The core demo deliberately avoids Google Maps Platform and Mapbox so it can
-    run without billing, expiring credits or per-request quotas. MapLibre and
-    OpenFreeMap provide the 3D/vector scene; manual roof-pin calibration is the
-    source of truth for camera placement.
+    A public Mapbox token may enhance the member scene and geocoding. MapLibre,
+    OpenFreeMap and manual roof-pin calibration remain available when it is not
+    configured, so camera placement and the core demo never depend on Mapbox.
     """
     return {
         "engine": "maplibre-free",
@@ -948,11 +968,13 @@ def member_map_config():
         "terrain_url": None,
         "projection": "mercator",
         "addresses_from_database": True,
-        "location_label": "Ness Avenue, Lakefield, Benoni",
-        "paid_providers_disabled": True,
+        "location_label": "Killarney Avenue, Lakefield, Benoni",
+        "mapbox_access_token": MAPBOX_ACCESS_TOKEN or None,
+        "mapbox_style_url": "mapbox://styles/mapbox/standard",
+        "paid_providers_disabled": not bool(MAPBOX_ACCESS_TOKEN),
         "google_photorealistic_3d": False,
         "google_street_view": False,
-        "mapbox_enabled": False,
+        "mapbox_enabled": bool(MAPBOX_ACCESS_TOKEN),
         "pin_editor_enabled": True,
         "geocoding_provider": "nominatim_optional_manual_pin_primary",
     }
@@ -1873,6 +1895,92 @@ def _start_incident_in_db(
     payload = _incident_payload(db, incident_id)
     assert payload is not None
     return True, payload
+
+
+def create_demo_intruder_incident(
+    actor: str = "Security demo operator",
+) -> dict[str, Any]:
+    """Create a complete test incident at one of the configured demo homes.
+
+    This powers the control-room demo button without pretending that a previous
+    camera upload already exists. Each run rotates to the next property and
+    creates the same durable profile, sighting, neighbour-watch and alert records
+    that a reviewed camera event would create.
+    """
+    initialise_member_store()
+    captured_at = _now()
+    with connect() as db:
+        cameras = db.execute(
+            """
+            SELECT * FROM member_cameras
+            WHERE user_id IN ('USR-001', 'USR-002', 'USR-003')
+            ORDER BY user_id, camera_id
+            """
+        ).fetchall()
+        if not cameras:
+            raise RuntimeError("No configured demo homes are available")
+        prior_runs = int(db.execute(
+            "SELECT COUNT(*) AS n FROM face_profiles WHERE anonymous_label LIKE 'Demo test intruder%'"
+        ).fetchone()["n"])
+        camera = cameras[prior_runs % len(cameras)]
+        profile_id = f"FACE-{uuid.uuid4().hex[:10].upper()}"
+        sighting_id = f"SIGHT-{uuid.uuid4().hex[:10].upper()}"
+        vector = np.zeros(16, dtype=np.float32)
+        vector[prior_runs % vector.size] = 1.0
+        label = f"Demo test intruder {prior_runs + 1}"
+        db.execute(
+            """
+            INSERT INTO face_profiles(
+                profile_id, anonymous_label, embedding, embedding_size, first_seen,
+                last_seen, sighting_count, system_status, review_required, last_classified_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 'CONFIRMED_INTRUDER', 1, ?)
+            """,
+            (
+                profile_id, label, vector.tobytes(), vector.size,
+                captured_at, captured_at, captured_at,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO face_sightings(
+                sighting_id, profile_id, user_id, camera_id, captured_at, similarity,
+                detection_confidence, latitude, longitude, embedding, embedding_size,
+                review_status
+            ) VALUES (?, ?, ?, ?, ?, 1.0, 0.99, ?, ?, ?, ?, 'CONFIRMED_INTRUDER')
+            """,
+            (
+                sighting_id, profile_id, camera["user_id"], camera["camera_id"],
+                captured_at, camera["latitude"], camera["longitude"],
+                vector.tobytes(), vector.size,
+            ),
+        )
+        db.execute(
+            "UPDATE member_cameras SET last_seen_at=? WHERE camera_id=?",
+            (captured_at, camera["camera_id"]),
+        )
+        sighting = db.execute(
+            "SELECT * FROM face_sightings WHERE sighting_id=?", (sighting_id,)
+        ).fetchone()
+        assert sighting is not None
+        _, incident = _start_incident_in_db(
+            db,
+            sighting,
+            "TRESPASSING",
+            30,
+            f"Control-room test alert generated at {camera['household']}.",
+            actor,
+        )
+        _audit(
+            db,
+            "face_sightings",
+            sighting_id,
+            "INSERT",
+            actor,
+            f"Test intruder detected at {camera['household']}",
+            {"profile_id": profile_id, "camera_id": camera["camera_id"]},
+        )
+    invalidate_face_gallery()
+    return incident
 
 
 def _profile_payload(db: sqlite3.Connection, profile_id: str, viewer_user_id: str | None = None) -> dict[str, Any] | None:
@@ -3059,6 +3167,7 @@ def priority_notifications(
                        d.selected_unit_id, d.eta_minutes
                 FROM security_notifications n
                 JOIN security_dispatches d ON d.dispatch_id=n.dispatch_id
+                WHERE n.status='QUEUED_LOCAL'
                 ORDER BY n.created_at DESC LIMIT ?
                 """,
                 (limit * 4,),
